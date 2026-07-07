@@ -7,6 +7,8 @@ import (
 	tea "github.com/charmbracelet/bubbletea"
 	"github.com/charmbracelet/lipgloss"
 	"github.com/charmbracelet/x/ansi"
+
+	"railway-tui/internal/ui/theme"
 )
 
 // handleGlobalKey processes app-level keybindings. Returns (cmd, handled).
@@ -473,6 +475,20 @@ func clampBlock(s string, w int) string {
 		}
 	}
 	return strings.Join(lines, "\n")
+}
+
+// warningFooter renders confirmations as a single highlighted row. Bordered
+// toast styles are intentionally avoided here because pane footers only reserve
+// one row.
+func warningFooter(styles *theme.Styles, msg string, w int) string {
+	if w > 0 {
+		msg = ansi.Truncate(msg, w, "...")
+	}
+	return lipgloss.NewStyle().
+		Foreground(styles.T.Bg).
+		Background(styles.T.Warn).
+		Bold(true).
+		Render(msg)
 }
 
 func stripANSI(s string) string {

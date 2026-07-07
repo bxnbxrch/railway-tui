@@ -305,7 +305,7 @@ func (p *servicePane) View() string {
 	foot := p.styles.Help.Render("[g]enerate domain [d]elete [o]pen [r]efresh · ↑↓ move")
 	if p.confirming {
 		if d, ok := p.selectedDomain(); ok {
-			foot = p.styles.ToastWarn.Render(fmt.Sprintf(" DELETE domain %s?  [y/N] ", d.Domain))
+			foot = warningFooter(p.styles, fmt.Sprintf(" DELETE domain %s?  [y/N] ", d.Domain), p.width)
 		}
 	}
 	return clampBlock(lipgloss.JoinVertical(lipgloss.Left, head, p.vp.View(), foot), p.width)

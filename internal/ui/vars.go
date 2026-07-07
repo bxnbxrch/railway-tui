@@ -302,7 +302,7 @@ func (p *varsPane) View() string {
 		foot = p.input.View()
 	} else if p.confirming {
 		if v, ok := p.selected(); ok {
-			foot = p.styles.ToastWarn.Render(fmt.Sprintf(" DELETE %s from %s?  [y/N] ", v.Name, name))
+			foot = warningFooter(p.styles, fmt.Sprintf(" DELETE %s from %s?  [y/N] ", v.Name, name), p.width)
 		}
 	} else if p.errMsg != "" && len(p.vars) > 0 {
 		foot = lipgloss.NewStyle().Foreground(p.styles.T.Bad).Render(p.errMsg)

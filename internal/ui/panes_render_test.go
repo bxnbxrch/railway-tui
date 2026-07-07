@@ -70,6 +70,48 @@ func TestNewPanesRenderNoOverflow(t *testing.T) {
 	}
 }
 
+func TestConfirmFootersStayInsidePane(t *testing.T) {
+	st := theme.NewStyles(theme.Default())
+	svc := model.Service{ID: "s1", Name: "a-service-with-a-very-long-name"}
+
+	deploys := newDeploysPane(st)
+	deploys.setServices("production-with-a-long-name", []model.Service{svc})
+	deploys.confirming = true
+	deploys.action = "from-source"
+
+	vars := newVarsPane(st)
+	vars.setService("production", svc)
+	vars.setVars("s1", []model.Variable{{Name: "A_VERY_LONG_VARIABLE_NAME_THAT_MUST_CLIP", Value: "secret"}})
+	vars.confirming = true
+
+	service := newServicePane(st)
+	service.setService("production", svc)
+	service.setDomains("s1", []model.Domain{{Domain: "a-very-long-domain-name-that-must-clip.example.com"}})
+	service.confirming = true
+
+	type pane interface {
+		setSize(w, h int)
+		View() string
+	}
+	panes := map[string]pane{"deploys": deploys, "vars": vars, "service": service}
+
+	for _, size := range [][2]int{{60, 20}, {40, 12}, {28, 8}} {
+		w, h := size[0], size[1]
+		for name, p := range panes {
+			p.setSize(w, h)
+			view := p.View()
+			if got := lipgloss.Height(view); got > h {
+				t.Fatalf("%s @ %dx%d: height %d exceeds %d:\n%s", name, w, h, got, h, view)
+			}
+			for i, line := range strings.Split(view, "\n") {
+				if lw := lipgloss.Width(line); lw > w {
+					t.Fatalf("%s @ %dx%d: line %d width %d exceeds %d:\n%q", name, w, h, i, lw, w, line)
+				}
+			}
+		}
+	}
+}
+
 func pts(vals ...float64) []model.MetricPoint {
 	out := make([]model.MetricPoint, len(vals))
 	for i, v := range vals {

@@ -281,16 +281,20 @@ func (p *deploysPane) renderHistory(s model.Service) []string {
 func (p *deploysPane) View() string {
 	head := p.styles.Title.Render(fmt.Sprintf("Deployments — %s", orDash(p.env)))
 	body := p.vp.View()
-	help := p.styles.Help.Render("[enter]expand · [R]edeploy [x]restart [F]rom-source [D]own")
 
-	out := lipgloss.JoinVertical(lipgloss.Left, head, body, help)
+	// The footer occupies exactly one row so the pane never grows past the
+	// height it was sized to. When confirming, the warning banner takes the
+	// help line's place (rather than being appended below, which pushed a
+	// bordered box off the bottom of the pane). It's a flat highlighted line,
+	// not a bordered box, so it can't overflow vertically.
+	footer := p.styles.Help.Render("[enter]expand · [R]edeploy [x]restart [F]rom-source [D]own")
 	if p.confirming {
 		if svc, ok := p.selected(); ok {
 			msg := fmt.Sprintf(" %s %q on %s?  [y/N] ", actionLabel(p.action), svc.Name, p.env)
-			out += "\n" + p.styles.ToastWarn.Render(msg)
+			footer = warningFooter(p.styles, msg, p.width)
 		}
 	}
-	return out
+	return clampBlock(lipgloss.JoinVertical(lipgloss.Left, head, body, footer), p.width)
 }
 
 // actionLabel renders a deploy action as a readable confirmation verb.
