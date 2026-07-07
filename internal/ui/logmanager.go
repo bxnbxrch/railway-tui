@@ -189,45 +189,60 @@ func (m *logManager) pump(ctx context.Context, src model.Source, project string)
 			m.emit(ctx, src, streamFailed, err.Error(), seeded)
 			return
 		}
-		m.emit(ctx, src, streamLive, "", seeded)
-		got := m.drain(ctx, ls)
+		got := m.drain(ctx, src, ls, seeded) // emits live on first line
 		dbg.Logf("logmgr STREAM DONE [%s] (one-shot; not reconnecting)", key)
 		m.emit(ctx, src, streamEnded, ls.Stderr(), seeded+got)
 		return
 	}
 
+	// Continuous streams: `railway logs` ends when the server rotates the
+	// stream, so we reconnect in a loop. The health we surface is deliberately
+	// smoothed so a *healthy* rotation never strobes the sidebar:
+	//   - "live" is emitted only when a line actually arrives (see drain), not
+	//     when the process starts — a stream that dies instantly won't flash
+	//     green first.
+	//   - A reconnect that previously delivered data stays "live" through the
+	//     brief gap (no "reconnecting" flicker); we only downgrade to
+	//     "reconnecting" once a reconnect comes back empty, and escalate to a
+	//     steady "failed" after several consecutive empty attempts rather than
+	//     flashing forever.
 	backoff := time.Second
 	const maxBackoff = 20 * time.Second
+	const failAfterEmpty = 3
 	total := seeded
+	emptyStreak := 0
 	for ctx.Err() == nil {
 		ls, err := m.client.StartLogStream(ctx, src, project)
 		if err != nil {
 			dbg.Logf("logmgr STREAM START ERR [%s]: %v (retrying in %s)", key, err, backoff)
-			m.emit(ctx, src, streamFailed, err.Error(), total)
+			emptyStreak++
+			m.escalate(ctx, src, emptyStreak, failAfterEmpty, err.Error(), total)
 		} else {
-			m.emit(ctx, src, streamLive, "", total)
-			got := m.drain(ctx, ls)
+			got := m.drain(ctx, src, ls, total) // emits live on first line
 			total += got
-			if got > 0 {
-				// A stream that delivered data resets the backoff, so a normal
-				// server-side rotation reconnects promptly.
-				backoff = time.Second
-			}
 			if ctx.Err() != nil {
 				return
 			}
-			reason := ls.Stderr()
-			if reason == "" {
-				if e := ls.Err(); e != nil {
-					reason = e.Error()
+			if got > 0 {
+				// Healthy rotation: reconnect promptly and stay "live" through
+				// the gap — do not emit any transition, so the icon holds green.
+				emptyStreak = 0
+				backoff = time.Second
+			} else {
+				emptyStreak++
+				reason := ls.Stderr()
+				if reason == "" {
+					if e := ls.Err(); e != nil {
+						reason = e.Error()
+					}
 				}
+				m.escalate(ctx, src, emptyStreak, failAfterEmpty, reason, total)
 			}
-			m.emit(ctx, src, streamReconnecting, reason, total)
 		}
 		if ctx.Err() != nil {
 			return
 		}
-		dbg.Logf("logmgr RECONNECT [%s] in %s", key, backoff)
+		dbg.Logf("logmgr RECONNECT [%s] in %s (emptyStreak=%d)", key, backoff, emptyStreak)
 		if !sleepCtx(ctx, backoff) {
 			return
 		}
@@ -240,6 +255,18 @@ func (m *logManager) pump(ctx context.Context, src model.Source, project string)
 	}
 }
 
+// escalate emits the health transition for a reconnect that produced no data:
+// "reconnecting" for the first few empty attempts (a transient blip), then a
+// steady "failed" once the stream is clearly not coming back — instead of
+// flapping between states indefinitely.
+func (m *logManager) escalate(ctx context.Context, src model.Source, streak, limit int, reason string, total int) {
+	if streak >= limit {
+		m.emit(ctx, src, streamFailed, reason, total)
+	} else {
+		m.emit(ctx, src, streamReconnecting, reason, total)
+	}
+}
+
 // isContinuous reports whether a log kind represents an ongoing live stream
 // (worth reconnecting) as opposed to a finite historical record (build logs).
 func isContinuous(k model.LogKind) bool {
@@ -247,14 +274,20 @@ func isContinuous(k model.LogKind) bool {
 }
 
 // drain forwards a stream's lines to the aggregator until it ends or ctx is
-// cancelled. Returns the number of lines received.
-func (m *logManager) drain(ctx context.Context, ls *railwaycli.LogStream) int {
+// cancelled. It emits "live" the moment the first line arrives (so a stream
+// that starts but never delivers never shows green). total is the running
+// line count before this stream, used to report an accurate count with the
+// live transition. Returns the number of lines received from this stream.
+func (m *logManager) drain(ctx context.Context, src model.Source, ls *railwaycli.LogStream, total int) int {
 	got := 0
 	for {
 		select {
 		case ll, ok := <-ls.Lines:
 			if !ok {
 				return got
+			}
+			if got == 0 {
+				m.emit(ctx, src, streamLive, "", total)
 			}
 			got++
 			select {
