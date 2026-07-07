@@ -156,14 +156,22 @@ func newNotifyCenter(styles *theme.Styles, dur time.Duration) *notifyCenter {
 
 func (n *notifyCenter) setDur(d time.Duration) { n.dur = d }
 
+const maxLiveToasts = 20
+
 // push adds a notification to history and shows a toast; returns a cmd that
-// fires when the toast should expire.
+// fires when the toast should expire. This is defense-in-depth against any
+// future burst of distinct notifications — only the newest maxLiveToasts stay
+// live (overlay() only ever renders the last 4 anyway), so a flood can't grow
+// the live queue unboundedly or spam unlimited pending expiry timers.
 func (n *notifyCenter) push(note notification) tea.Cmd {
 	n.history = append(n.history, note)
 	if len(n.history) > 500 {
 		n.history = n.history[len(n.history)-500:]
 	}
 	n.toasts = append(n.toasts, toast{note: note, expires: time.Now().Add(n.dur)})
+	if len(n.toasts) > maxLiveToasts {
+		n.toasts = n.toasts[len(n.toasts)-maxLiveToasts:]
+	}
 	d := n.dur
 	return tea.Tick(d, func(time.Time) tea.Msg { return toastExpiredMsg{} })
 }

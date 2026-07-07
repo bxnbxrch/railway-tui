@@ -120,11 +120,12 @@ func (p *logsPane) setSources(srcs []model.Source) {
 }
 
 // append inserts a line, keeping the buffer roughly time-ordered and capped.
-func (p *logsPane) append(ll model.LogLine) {
-	// Drop replayed duplicates (tail/stream/reconnect overlap) before the
-	// timestamp is synthesized, so identical lines share a fingerprint.
+// Returns false if the line was dropped as a replayed duplicate (tail/stream/
+// reconnect overlap) — callers should skip error/notification handling for
+// dropped lines so a replay flood can't repeatedly re-trigger them.
+func (p *logsPane) append(ll model.LogLine) bool {
 	if !ll.Timestamp.IsZero() && p.dupe(ll) {
-		return
+		return false
 	}
 	if ll.Timestamp.IsZero() {
 		ll.Timestamp = time.Now()
@@ -146,6 +147,7 @@ func (p *logsPane) append(ll model.LogLine) {
 		p.buf = p.buf[len(p.buf)-logBufferCap:]
 	}
 	p.reflow()
+	return true
 }
 
 // matches applies the current filter string to a line.

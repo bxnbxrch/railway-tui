@@ -344,14 +344,17 @@ func (a *App) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 
 	case logLineMsg:
 		ll := model.LogLine(m)
-		a.logs.append(ll)
-		// Detected errors feed the Errors pane (always) and notifications
-		// (subject to config).
-		if a.watcher.isError(ll) {
-			a.errors.append(ll)
-		}
-		if note := a.watcher.onLogLine(ll); note != nil {
-			cmds = append(cmds, a.notify.push(*note))
+		isNew := a.logs.append(ll)
+		// Only react to genuinely new lines — a replayed duplicate (from a
+		// tail seed or stream reconnect) must not re-trigger an error entry
+		// or toast every time it reappears.
+		if isNew {
+			if a.watcher.isError(ll) {
+				a.errors.append(ll)
+			}
+			if note := a.watcher.onLogLine(ll); note != nil {
+				cmds = append(cmds, a.notify.push(*note))
+			}
 		}
 		// Re-arm the pump.
 		cmds = append(cmds, a.logMgr.waitForLine())

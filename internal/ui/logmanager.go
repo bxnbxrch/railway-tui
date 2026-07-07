@@ -111,6 +111,21 @@ func (m *logManager) pump(ctx context.Context, src model.Source) {
 	}
 	cancelTail()
 
+	// Build logs are a finite, historical record of a single build that has
+	// already run — not a live stream. Reconnecting after it ends would just
+	// replay the entire build output on a loop (this previously caused the
+	// same build error to flash repeatedly). Run it once and stop.
+	if !isContinuous(src.Kind) {
+		ls, err := m.client.StartLogStream(ctx, src, m.project)
+		if err != nil {
+			dbg.Logf("logmgr STREAM START ERR [%s]: %v (one-shot, not retrying)", src.Key(), err)
+			return
+		}
+		m.drain(ctx, ls)
+		dbg.Logf("logmgr STREAM DONE [%s] (one-shot; not reconnecting)", src.Key())
+		return
+	}
+
 	backoff := time.Second
 	const maxBackoff = 20 * time.Second
 	for ctx.Err() == nil {
@@ -136,6 +151,12 @@ func (m *logManager) pump(ctx context.Context, src model.Source) {
 			}
 		}
 	}
+}
+
+// isContinuous reports whether a log kind represents an ongoing live stream
+// (worth reconnecting) as opposed to a finite historical record (build logs).
+func isContinuous(k model.LogKind) bool {
+	return k == model.LogDeploy || k == model.LogHTTP || k == model.LogNetwork
 }
 
 // drain forwards a stream's lines to the aggregator until it ends or ctx is
