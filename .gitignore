@@ -1,0 +1,11 @@
+# Built binary
+/railway-tui
+
+# Go build/test artifacts
+*.exe
+*.out
+*.test
+
+# Editor/OS cruft
+.DS_Store
+*.swp
