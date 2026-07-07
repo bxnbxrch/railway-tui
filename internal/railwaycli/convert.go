@@ -50,6 +50,16 @@ func (r rawService) toModel() model.Service {
 	return svc
 }
 
+func (r rawDomainFull) toModel() model.Domain {
+	return model.Domain{
+		ID:         r.ID,
+		Domain:     r.Domain,
+		Type:       r.Type,
+		TargetPort: r.TargetPort,
+		SyncStatus: r.SyncStatus,
+	}
+}
+
 func (r rawDeployment) toModel() model.Deployment {
 	return model.Deployment{
 		ID:            r.ID,

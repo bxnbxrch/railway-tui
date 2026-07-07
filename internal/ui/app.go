@@ -24,13 +24,19 @@ type paneID string
 const (
 	paneLogs     paneID = "logs"
 	paneErrors   paneID = "errors"
+	paneMetrics  paneID = "metrics"
 	paneDeploys  paneID = "deploys"
+	paneVars     paneID = "vars"
+	paneService  paneID = "service"
 	paneTopology paneID = "topology"
 	paneNotify   paneID = "notifications"
 	paneSettings paneID = "settings"
 )
 
-var tabOrder = []paneID{paneLogs, paneErrors, paneDeploys, paneTopology, paneNotify, paneSettings}
+var tabOrder = []paneID{
+	paneLogs, paneErrors, paneMetrics, paneDeploys, paneVars,
+	paneService, paneTopology, paneNotify, paneSettings,
+}
 
 func tabTitle(p paneID) string {
 	switch p {
@@ -38,8 +44,14 @@ func tabTitle(p paneID) string {
 		return "Logs"
 	case paneErrors:
 		return "Errors"
+	case paneMetrics:
+		return "Metrics"
 	case paneDeploys:
 		return "Deploys"
+	case paneVars:
+		return "Vars"
+	case paneService:
+		return "Service"
 	case paneTopology:
 		return "Topology"
 	case paneNotify:
@@ -70,11 +82,18 @@ type App struct {
 	// panes
 	logs     *logsPane
 	errors   *errorsPane
+	metrics  *metricsPane
 	deploys  *deploysPane
+	vars     *varsPane
+	service  *servicePane
 	topology *topologyPane
 	settings *settingsPane
 	notify   *notifyCenter
 	picker   *picker
+
+	// focused service — Metrics/Vars/Service panes follow it.
+	focused   model.Service
+	focusedID string
 
 	logMgr      *logManager
 	watcher     *watcher
@@ -111,7 +130,10 @@ func New(cfg config.Config, client *railwaycli.Client) *App {
 	}
 	a.logs = newLogsPane(st)
 	a.errors = newErrorsPane(st)
+	a.metrics = newMetricsPane(st)
 	a.deploys = newDeploysPane(st)
+	a.vars = newVarsPane(st)
+	a.service = newServicePane(st)
 	a.topology = newTopologyPane(st)
 	a.settings = newSettingsPane(st, &a.cfg)
 	a.notify = newNotifyCenter(st, cfg.Notifications.Toast())
@@ -157,6 +179,7 @@ func (a *App) Init() tea.Cmd {
 		a.loadServices(),
 		a.logMgr.waitForLine(),
 		a.deployTick(),
+		a.metricsTick(),
 	)
 }
 
@@ -205,6 +228,71 @@ func (a *App) deployTick() tea.Cmd {
 	return tea.Tick(a.cfg.Polling.Deploy(), func(time.Time) tea.Msg { return deployTickMsg{} })
 }
 
+func (a *App) metricsTick() tea.Cmd {
+	return tea.Tick(a.cfg.Polling.Metrics(), func(time.Time) tea.Msg { return metricsTickMsg{} })
+}
+
+// loadMetrics fetches raw metric series for a service.
+func (a *App) loadMetrics(serviceID, serviceName string) tea.Cmd {
+	c, proj, env := a.client, a.projectID, a.env
+	return func() tea.Msg {
+		ctx, cancel := context.WithTimeout(context.Background(), 25*time.Second)
+		defer cancel()
+		m, err := c.Metrics(ctx, proj, env, serviceName)
+		if err != nil {
+			return metricsErrMsg{serviceID: serviceID, err: err}
+		}
+		return metricsLoadedMsg{serviceID: serviceID, metrics: m}
+	}
+}
+
+// loadVars fetches the environment variables for a service.
+func (a *App) loadVars(serviceID, serviceName string) tea.Cmd {
+	c, proj, env := a.client, a.projectID, a.env
+	return func() tea.Msg {
+		ctx, cancel := context.WithTimeout(context.Background(), 25*time.Second)
+		defer cancel()
+		vs, err := c.Variables(ctx, proj, env, serviceName)
+		if err != nil {
+			return varsErrMsg{serviceID: serviceID, err: err}
+		}
+		return varsLoadedMsg{serviceID: serviceID, vars: vs}
+	}
+}
+
+// loadDomains fetches the domains attached to a service.
+func (a *App) loadDomains(serviceID, serviceName string) tea.Cmd {
+	c, proj, env := a.client, a.projectID, a.env
+	return func() tea.Msg {
+		ctx, cancel := context.WithTimeout(context.Background(), 25*time.Second)
+		defer cancel()
+		ds, err := c.Domains(ctx, proj, env, serviceName)
+		if err != nil {
+			return domainsErrMsg{serviceID: serviceID, err: err}
+		}
+		return domainsLoadedMsg{serviceID: serviceID, domains: ds}
+	}
+}
+
+// setFocus points the follow-along panes at a service, kicking off the fetches
+// each needs. Panes ignore the fetch results when they don't match their
+// current focus, so stale in-flight loads are harmless.
+func (a *App) setFocus(env string, svc model.Service) tea.Cmd {
+	a.focused = svc
+	a.focusedID = svc.ID
+	var cmds []tea.Cmd
+	if a.metrics.setService(env, svc) && svc.ID != "" {
+		cmds = append(cmds, a.loadMetrics(svc.ID, svc.Name))
+	}
+	if a.vars.setService(env, svc) && svc.ID != "" {
+		cmds = append(cmds, a.loadVars(svc.ID, svc.Name))
+	}
+	if a.service.setService(env, svc) && svc.ID != "" {
+		cmds = append(cmds, a.loadDomains(svc.ID, svc.Name))
+	}
+	return tea.Batch(cmds...)
+}
+
 // loadDeployments fetches a service's deployment history.
 func (a *App) loadDeployments(serviceID, serviceName string) tea.Cmd {
 	c, proj, env := a.client, a.projectID, a.env
@@ -229,6 +317,31 @@ type deploymentsLoadedMsg struct {
 	deployments []model.Deployment
 }
 type deployTickMsg struct{}
+type metricsTickMsg struct{}
+type metricsLoadedMsg struct {
+	serviceID string
+	metrics   *model.Metrics
+}
+type metricsErrMsg struct {
+	serviceID string
+	err       error
+}
+type varsLoadedMsg struct {
+	serviceID string
+	vars      []model.Variable
+}
+type varsErrMsg struct {
+	serviceID string
+	err       error
+}
+type domainsLoadedMsg struct {
+	serviceID string
+	domains   []model.Domain
+}
+type domainsErrMsg struct {
+	serviceID string
+	err       error
+}
 type errMsg struct {
 	where string
 	err   error
@@ -262,6 +375,8 @@ func (a *App) switchContext(projectID, projectName, env string) tea.Cmd {
 	a.logs.reflow()
 	a.watcher.lastSeen = map[string]model.DeployStatus{}
 	a.errors.clear()
+	a.focused = model.Service{}
+	a.focusedID = ""      // re-focus first service of the new context on next load
 	a.autoStarted = false // re-auto-start deploy logs for the new context
 	a.status = fmt.Sprintf("switched to %s / %s", projectName, env)
 	return tea.Batch(a.loadTopology(), a.loadServices())
@@ -310,6 +425,22 @@ func (a *App) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		dbg.Logf("app services loaded: %d service(s) for env=%q project=%q", len(a.services), a.env, a.projectID)
 		a.deploys.setServices(a.env, a.services)
 		a.logs.setSources(a.buildSources())
+		// Focus the first service on first load; otherwise keep the follow-along
+		// panes' service data fresh (status/replicas may have changed) without
+		// discarding their already-fetched metrics/vars/domains.
+		if a.focusedID == "" && len(a.services) > 0 {
+			cmds = append(cmds, a.setFocus(a.env, a.services[0]))
+		} else {
+			for _, s := range a.services {
+				if s.ID == a.focusedID {
+					a.focused = s
+					a.metrics.setService(a.env, s)
+					a.vars.setService(a.env, s)
+					a.service.setService(a.env, s)
+					break
+				}
+			}
+		}
 		// On first load, auto-start deploy logs for every service so the
 		// merged log view populates immediately (compose-style) without the
 		// user having to toggle each source by hand.
@@ -341,6 +472,66 @@ func (a *App) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			}
 		}
 		return a, tea.Batch(cmds...)
+
+	case metricsTickMsg:
+		cmds = append(cmds, a.metricsTick())
+		// Only poll metrics while the pane is on screen and a service is focused.
+		if a.focusedID != "" && a.primaryOrSplitIs(paneMetrics) {
+			cmds = append(cmds, a.loadMetrics(a.focusedID, a.focused.Name))
+		}
+		return a, tea.Batch(cmds...)
+
+	case metricsLoadedMsg:
+		a.metrics.setMetrics(m.serviceID, m.metrics)
+		return a, nil
+
+	case metricsErrMsg:
+		a.metrics.setError(m.serviceID, m.err.Error())
+		return a, nil
+
+	case loadMetricsMsg:
+		cmds = append(cmds, a.loadMetrics(m.serviceID, m.serviceName))
+		return a, tea.Batch(cmds...)
+
+	case varsLoadedMsg:
+		a.vars.setVars(m.serviceID, m.vars)
+		return a, nil
+
+	case varsErrMsg:
+		a.vars.setError(m.serviceID, m.err.Error())
+		return a, nil
+
+	case loadVarsMsg:
+		cmds = append(cmds, a.loadVars(m.serviceID, m.serviceName))
+		return a, tea.Batch(cmds...)
+
+	case varsActionMsg:
+		cmds = append(cmds, a.runVarsAction(m))
+		return a, tea.Batch(cmds...)
+
+	case domainsLoadedMsg:
+		a.service.setDomains(m.serviceID, m.domains)
+		return a, nil
+
+	case domainsErrMsg:
+		a.service.setDomainError(m.serviceID, m.err.Error())
+		return a, nil
+
+	case loadDomainsMsg:
+		cmds = append(cmds, a.loadDomains(m.serviceID, m.serviceName))
+		return a, tea.Batch(cmds...)
+
+	case domainActionMsg:
+		cmds = append(cmds, a.runDomainAction(m))
+		return a, tea.Batch(cmds...)
+
+	case openURLMsg:
+		if err := openURL(m.url); err != nil {
+			a.status = "open failed: " + err.Error()
+		} else {
+			a.status = "opened " + m.label + " in browser"
+		}
+		return a, nil
 
 	case logLineMsg:
 		ll := model.LogLine(m)
@@ -379,8 +570,10 @@ func (a *App) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			a.logMgr.add(src)
 			a.logs.activeKey[src.Key()] = true
 		}
+		// Point the follow-along panes (Metrics/Vars/Service) at it too.
+		cmds = append(cmds, a.setFocus(a.env, m.service))
 		a.primary = paneLogs
-		a.status = "focused logs on " + m.service.Name
+		a.status = "focused on " + m.service.Name
 		return a, tea.Batch(cmds...)
 
 	case loadDeploymentsMsg:
@@ -402,6 +595,29 @@ func (a *App) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			a.status = m.action + " " + m.service + " ✔"
 		}
 		cmds = append(cmds, a.loadServices())
+		return a, tea.Batch(cmds...)
+
+	case varsActionDoneMsg:
+		if m.err != nil {
+			a.status = "variable " + m.action + " failed: " + m.err.Error()
+		} else {
+			a.status = fmt.Sprintf("%s %s ✔", m.action, m.key)
+			// Refresh the list so the pane reflects the change.
+			cmds = append(cmds, a.loadVars(m.serviceID, m.serviceName))
+		}
+		return a, tea.Batch(cmds...)
+
+	case domainActionDoneMsg:
+		if m.err != nil {
+			a.status = "domain " + m.action + " failed: " + m.err.Error()
+		} else {
+			if m.action == "generate" && m.created != "" {
+				a.status = "created domain " + m.created + " ✔"
+			} else {
+				a.status = "domain " + m.action + " ✔"
+			}
+			cmds = append(cmds, a.loadDomains(m.serviceID, m.serviceName))
+		}
 		return a, tea.Batch(cmds...)
 
 	case settingsChangedMsg:
@@ -471,7 +687,62 @@ func (a *App) runDeployAction(m deployActionMsg) tea.Cmd {
 			err = c.Redeploy(ctx, proj, env, svc)
 		case "restart":
 			err = c.Restart(ctx, proj, env, svc)
+		case "from-source":
+			err = c.RedeployFromSource(ctx, proj, env, svc)
+		case "down":
+			err = c.Down(ctx, proj, env, svc)
 		}
 		return actionDoneMsg{action: action, service: svc, err: err}
+	}
+}
+
+// varsActionDoneMsg / domainActionDoneMsg report the result of a mutation so the
+// app can surface status and refresh the affected pane.
+type varsActionDoneMsg struct {
+	serviceID   string
+	serviceName string
+	action      string
+	key         string
+	err         error
+}
+
+type domainActionDoneMsg struct {
+	serviceID   string
+	serviceName string
+	action      string
+	created     string
+	err         error
+}
+
+func (a *App) runVarsAction(m varsActionMsg) tea.Cmd {
+	c, proj := a.client, a.projectID
+	return func() tea.Msg {
+		ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
+		defer cancel()
+		var err error
+		switch m.action {
+		case "set":
+			err = c.SetVariable(ctx, proj, m.env, m.service.Name, m.key+"="+m.value, false)
+		case "delete":
+			err = c.DeleteVariable(ctx, proj, m.env, m.service.Name, m.key)
+		}
+		return varsActionDoneMsg{serviceID: m.service.ID, serviceName: m.service.Name, action: m.action, key: m.key, err: err}
+	}
+}
+
+func (a *App) runDomainAction(m domainActionMsg) tea.Cmd {
+	c, proj := a.client, a.projectID
+	return func() tea.Msg {
+		ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
+		defer cancel()
+		var err error
+		var created string
+		switch m.action {
+		case "generate":
+			created, err = c.GenerateDomain(ctx, proj, m.env, m.service.Name, 0)
+		case "delete":
+			err = c.DeleteDomain(ctx, proj, m.env, m.service.Name, m.domain)
+		}
+		return domainActionDoneMsg{serviceID: m.service.ID, serviceName: m.service.Name, action: m.action, created: created, err: err}
 	}
 }

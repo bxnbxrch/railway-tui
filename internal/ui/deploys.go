@@ -131,6 +131,16 @@ func (p *deploysPane) Update(msg tea.Msg) tea.Cmd {
 				p.confirming = true
 				p.action = "restart"
 			}
+		case "F":
+			if len(p.services) > 0 {
+				p.confirming = true
+				p.action = "from-source"
+			}
+		case "D":
+			if len(p.services) > 0 {
+				p.confirming = true
+				p.action = "down"
+			}
 		case "pgup", "pgdown", "ctrl+u", "ctrl+d":
 			var cmd tea.Cmd
 			p.vp, cmd = p.vp.Update(msg)
@@ -271,16 +281,28 @@ func (p *deploysPane) renderHistory(s model.Service) []string {
 func (p *deploysPane) View() string {
 	head := p.styles.Title.Render(fmt.Sprintf("Deployments — %s", orDash(p.env)))
 	body := p.vp.View()
-	help := p.styles.Help.Render("[enter]expand ↑↓ move · [R]edeploy [x]restart")
+	help := p.styles.Help.Render("[enter]expand · [R]edeploy [x]restart [F]rom-source [D]own")
 
 	out := lipgloss.JoinVertical(lipgloss.Left, head, body, help)
 	if p.confirming {
 		if svc, ok := p.selected(); ok {
-			msg := fmt.Sprintf(" %s %q on %s?  [y/N] ", strings.ToUpper(p.action), svc.Name, p.env)
+			msg := fmt.Sprintf(" %s %q on %s?  [y/N] ", actionLabel(p.action), svc.Name, p.env)
 			out += "\n" + p.styles.ToastWarn.Render(msg)
 		}
 	}
 	return out
+}
+
+// actionLabel renders a deploy action as a readable confirmation verb.
+func actionLabel(action string) string {
+	switch action {
+	case "from-source":
+		return "REDEPLOY (from source)"
+	case "down":
+		return "REMOVE deployment"
+	default:
+		return strings.ToUpper(action)
+	}
 }
 
 func statusLabel(s model.DeployStatus) string {

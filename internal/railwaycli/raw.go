@@ -135,6 +135,22 @@ type rawProjectRef struct {
 	} `json:"environments"`
 }
 
+// --- domain list --json ---
+//
+// Shape: {"domains":[{"id","domain","type","targetPort","syncStatus",...}]}
+
+type rawDomainList struct {
+	Domains []rawDomainFull `json:"domains"`
+}
+
+type rawDomainFull struct {
+	ID         string `json:"id"`
+	Domain     string `json:"domain"`
+	Type       string `json:"type"`
+	TargetPort int    `json:"targetPort"`
+	SyncStatus string `json:"syncStatus"`
+}
+
 // --- metrics --raw --json ---
 
 type rawMetrics struct {

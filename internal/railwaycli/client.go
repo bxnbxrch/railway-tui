@@ -9,6 +9,8 @@ import (
 	"encoding/json"
 	"fmt"
 	"os/exec"
+	"sort"
+	"strconv"
 	"strings"
 	"time"
 
@@ -228,6 +230,157 @@ func (c *Client) Restart(ctx context.Context, project, env, service string) erro
 	args = appendScope(args, project, env, service)
 	_, err := c.run(ctx, args...)
 	return err
+}
+
+// RedeployFromSource redeploys pulling the latest commit/image from the
+// configured source (rather than re-running the existing deployment).
+func (c *Client) RedeployFromSource(ctx context.Context, project, env, service string) error {
+	args := []string{"redeploy", "--yes", "--from-source"}
+	args = appendScope(args, project, env, service)
+	_, err := c.run(ctx, args...)
+	return err
+}
+
+// Down removes (rolls back) the most recent deployment of a service.
+func (c *Client) Down(ctx context.Context, project, env, service string) error {
+	args := []string{"down", "--yes"}
+	args = appendScope(args, project, env, service)
+	_, err := c.run(ctx, args...)
+	return err
+}
+
+// Scale sets replica counts by region for a service. Pairs are "region=count"
+// (e.g. "eu-west=2"). At least one pair must be given.
+func (c *Client) Scale(ctx context.Context, project, env, service string, pairs ...string) error {
+	args := []string{"scale"}
+	args = appendScope(args, project, env, service)
+	args = append(args, pairs...)
+	_, err := c.run(ctx, args...)
+	return err
+}
+
+// Variables returns the environment variables for a service as a name->value
+// map. Values are raw secrets, so callers must mask them in the UI by default.
+func (c *Client) Variables(ctx context.Context, project, env, service string) ([]model.Variable, error) {
+	args := []string{"variable", "list", "--json"}
+	args = appendScope(args, project, env, service)
+	out, err := c.run(ctx, args...)
+	if err != nil {
+		return nil, err
+	}
+	// `variable list --json` emits a flat object: {"KEY":"value", ...}. Decode
+	// into map[string]any so numeric-looking values don't fail the unmarshal.
+	var raw map[string]any
+	if err := json.Unmarshal(out, &raw); err != nil {
+		return nil, fmt.Errorf("parse variable list: %w", err)
+	}
+	vars := make([]model.Variable, 0, len(raw))
+	for k, v := range raw {
+		vars = append(vars, model.Variable{Name: k, Value: stringify(v)})
+	}
+	sortVars(vars)
+	return vars, nil
+}
+
+// SetVariable sets a single KEY=VALUE pair on a service. skipDeploy avoids
+// triggering an immediate redeploy.
+func (c *Client) SetVariable(ctx context.Context, project, env, service, kv string, skipDeploy bool) error {
+	args := []string{"variable", "set", kv}
+	if skipDeploy {
+		args = append(args, "--skip-deploys")
+	}
+	args = appendScope(args, project, env, service)
+	_, err := c.run(ctx, args...)
+	return err
+}
+
+// DeleteVariable removes a variable by key from a service.
+func (c *Client) DeleteVariable(ctx context.Context, project, env, service, key string) error {
+	args := []string{"variable", "delete", key}
+	args = appendScope(args, project, env, service)
+	_, err := c.run(ctx, args...)
+	return err
+}
+
+// Domains lists the service + custom domains attached to a service.
+func (c *Client) Domains(ctx context.Context, project, env, service string) ([]model.Domain, error) {
+	args := []string{"domain", "list", "--json"}
+	args = appendScope(args, project, env, service)
+	out, err := c.run(ctx, args...)
+	if err != nil {
+		return nil, err
+	}
+	var raw rawDomainList
+	if err := json.Unmarshal(out, &raw); err != nil {
+		return nil, fmt.Errorf("parse domain list: %w", err)
+	}
+	ds := make([]model.Domain, 0, len(raw.Domains))
+	for _, r := range raw.Domains {
+		ds = append(ds, r.toModel())
+	}
+	return ds, nil
+}
+
+// GenerateDomain provisions a Railway-provided service domain and returns the
+// created hostname. port <= 0 lets Railway pick the target port.
+func (c *Client) GenerateDomain(ctx context.Context, project, env, service string, port int) (string, error) {
+	args := []string{"domain", "--json"}
+	if port > 0 {
+		args = append(args, "--port", itoaSimple(port))
+	}
+	args = appendScope(args, project, env, service)
+	out, err := c.run(ctx, args...)
+	if err != nil {
+		return "", err
+	}
+	// The create output shape isn't strictly documented; parse defensively for
+	// {"domain":"…"}, {"domains":[{"domain":"…"}]} or a bare string.
+	var m map[string]any
+	if json.Unmarshal(out, &m) == nil {
+		if d, ok := m["domain"].(string); ok && d != "" {
+			return d, nil
+		}
+		if arr, ok := m["domains"].([]any); ok && len(arr) > 0 {
+			if dm, ok := arr[0].(map[string]any); ok {
+				if d, ok := dm["domain"].(string); ok && d != "" {
+					return d, nil
+				}
+			}
+		}
+	}
+	return strings.TrimSpace(string(out)), nil
+}
+
+// DeleteDomain removes a service or custom domain from a service.
+func (c *Client) DeleteDomain(ctx context.Context, project, env, service, domain string) error {
+	args := []string{"domain", "delete", domain, "--yes"}
+	args = appendScope(args, project, env, service)
+	_, err := c.run(ctx, args...)
+	return err
+}
+
+// stringify renders a JSON value as a plain string for variable display.
+// Variable values are strings, but numbers/bools are handled defensively.
+func stringify(v any) string {
+	switch t := v.(type) {
+	case string:
+		return t
+	case float64:
+		return strconv.FormatFloat(t, 'f', -1, 64)
+	case bool:
+		return strconv.FormatBool(t)
+	case nil:
+		return ""
+	default:
+		return fmt.Sprintf("%v", t)
+	}
+}
+
+// sortVars orders variables case-insensitively by name for a stable list.
+func sortVars(vs []model.Variable) {
+	sort.Slice(vs, func(i, j int) bool {
+		return strings.ToLower(vs[i].Name) < strings.ToLower(vs[j].Name)
+	})
 }
 
 // appendScope adds --project/--environment/--service flags when set.

@@ -74,6 +74,26 @@ type Region struct {
 	Configured int
 }
 
+// Domain is a service or custom domain attached to a service.
+type Domain struct {
+	ID         string
+	Domain     string
+	Type       string // "service" | "custom"
+	TargetPort int
+	SyncStatus string
+}
+
+// URL returns the https URL for the domain.
+func (d Domain) URL() string {
+	return "https://" + d.Domain
+}
+
+// Variable is a single environment variable (name + raw value).
+type Variable struct {
+	Name  string
+	Value string
+}
+
 // Deployment is a single deployment record.
 type Deployment struct {
 	ID            string

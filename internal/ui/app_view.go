@@ -18,6 +18,12 @@ func (a *App) handleGlobalKey(m tea.KeyMsg) (tea.Cmd, bool) {
 	if a.deploys.confirming && a.primaryOrSplitIs(paneDeploys) {
 		return nil, false
 	}
+	if (a.vars.adding || a.vars.confirming) && a.primaryOrSplitIs(paneVars) {
+		return nil, false
+	}
+	if a.service.confirming && a.primaryOrSplitIs(paneService) {
+		return nil, false
+	}
 
 	switch m.String() {
 	case "ctrl+c", "Q":
@@ -50,13 +56,20 @@ func (a *App) handleGlobalKey(m tea.KeyMsg) (tea.Cmd, bool) {
 			return nil, true
 		}
 		return nil, true
-	case "1", "2", "3", "4", "5", "6":
+	case "1", "2", "3", "4", "5", "6", "7", "8", "9":
 		idx := int(m.String()[0] - '1')
 		if idx >= 0 && idx < len(tabOrder) {
 			a.primary = tabOrder[idx]
 			a.split = ""
 			a.focusSplit = false
 			a.resize()
+		}
+		return nil, true
+	case "O":
+		// Open the project dashboard in the browser.
+		if a.projectID != "" {
+			url := dashboardURL(a.projectID, "")
+			return func() tea.Msg { return openURLMsg{url: url, label: "dashboard"} }, true
 		}
 		return nil, true
 	case "?":
@@ -102,8 +115,14 @@ func (a *App) routeKey(msg tea.Msg) tea.Cmd {
 		return cmd
 	case paneErrors:
 		return a.errors.Update(msg)
+	case paneMetrics:
+		return a.metrics.Update(msg)
 	case paneDeploys:
 		return a.deploys.Update(msg)
+	case paneVars:
+		return a.vars.Update(msg)
+	case paneService:
+		return a.service.Update(msg)
 	case paneTopology:
 		return a.topology.Update(msg)
 	case paneSettings:
@@ -152,8 +171,14 @@ func (a *App) sizePane(p paneID, w, h int) {
 		a.logs.setSize(w, h)
 	case paneErrors:
 		a.errors.setSize(w, h)
+	case paneMetrics:
+		a.metrics.setSize(w, h)
 	case paneDeploys:
 		a.deploys.setSize(w, h)
+	case paneVars:
+		a.vars.setSize(w, h)
+	case paneService:
+		a.service.setSize(w, h)
 	case paneTopology:
 		a.topology.setSize(w, h)
 	case paneSettings:
@@ -168,8 +193,14 @@ func (a *App) paneView(p paneID, w, h int) string {
 		s = a.logs.View()
 	case paneErrors:
 		s = a.errors.View()
+	case paneMetrics:
+		s = a.metrics.View()
 	case paneDeploys:
 		s = a.deploys.View()
+	case paneVars:
+		s = a.vars.View()
+	case paneService:
+		s = a.service.View()
 	case paneTopology:
 		s = a.topology.View()
 	case paneSettings:
@@ -285,7 +316,7 @@ func (a *App) renderStatus() string {
 	if a.status != "" {
 		left += " · " + a.status
 	}
-	help := "[p]roject [e]nv [L]ayout · 1-6 panes · [tab]focus · [q]uit"
+	help := "[p]roj [e]nv [L]ayout · 1-9 panes · [tab]focus · [O]pen · [q]uit"
 	// Truncate the (variable-length) status text so the line never overflows.
 	avail := a.width - lipgloss.Width(help) - 2
 	if avail < 0 {
