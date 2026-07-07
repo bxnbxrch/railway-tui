@@ -236,6 +236,11 @@ func (a *App) View() string {
 		return lipgloss.Place(a.width, a.height, lipgloss.Center, lipgloss.Center, overlay)
 	}
 
+	// Overlay in-flight build/deploy progress bottom-right.
+	if prog := a.deployProgressOverlay(); prog != "" {
+		frame = overlayBottomRight(frame, prog, a.width, a.height)
+	}
+
 	// Overlay toasts top-right.
 	toasts := a.notify.overlay(a.width)
 	if toasts != "" {
@@ -357,6 +362,36 @@ func overlayTopRight(base, overlay string, width int) string {
 		base := baseLines[row]
 		// Truncate base to startCol, then append overlay line.
 		truncated := ansiTruncate(base, startCol)
+		pad := startCol - lipgloss.Width(truncated)
+		if pad < 0 {
+			pad = 0
+		}
+		baseLines[row] = truncated + strings.Repeat(" ", pad) + ol
+	}
+	return strings.Join(baseLines, "\n")
+}
+
+// overlayBottomRight composites an overlay block onto the bottom-right of base,
+// anchored just above the status bar (the last row).
+func overlayBottomRight(base, overlay string, width, height int) string {
+	baseLines := strings.Split(base, "\n")
+	ovLines := strings.Split(overlay, "\n")
+	ovW := lipgloss.Width(overlay)
+	startCol := width - ovW - 1
+	if startCol < 0 {
+		startCol = 0
+	}
+	// Place the block so its last row sits one line above the status bar.
+	startRow := height - 1 - len(ovLines)
+	if startRow < 1 {
+		startRow = 1
+	}
+	for i, ol := range ovLines {
+		row := startRow + i
+		if row < 0 || row >= len(baseLines) {
+			continue
+		}
+		truncated := ansiTruncate(baseLines[row], startCol)
 		pad := startCol - lipgloss.Width(truncated)
 		if pad < 0 {
 			pad = 0

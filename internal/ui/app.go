@@ -99,6 +99,10 @@ type App struct {
 	watcher     *watcher
 	autoStarted bool // deploy logs auto-enabled on first load
 
+	// deploy-progress overlay animation
+	progressFrame     int
+	progressAnimating bool
+
 	// view state
 	primary    paneID
 	split      paneID // "" = single pane
@@ -232,6 +236,33 @@ func (a *App) metricsTick() tea.Cmd {
 	return tea.Tick(a.cfg.Polling.Metrics(), func(time.Time) tea.Msg { return metricsTickMsg{} })
 }
 
+// progressTick drives the deploy-progress overlay's spinner/bar animation. It
+// only runs while a deploy is in flight (see progressTickMsg handling).
+func (a *App) progressTick() tea.Cmd {
+	return tea.Tick(400*time.Millisecond, func(time.Time) tea.Msg { return progressTickMsg{} })
+}
+
+// hasActiveDeploys reports whether any service is currently building/deploying.
+func (a *App) hasActiveDeploys() bool {
+	for _, s := range a.services {
+		if s.Status.Active() {
+			return true
+		}
+	}
+	return false
+}
+
+// activeDeploys returns the services currently building/deploying.
+func (a *App) activeDeploys() []model.Service {
+	var out []model.Service
+	for _, s := range a.services {
+		if s.Status.Active() {
+			out = append(out, s)
+		}
+	}
+	return out
+}
+
 // loadMetrics fetches raw metric series for a service.
 func (a *App) loadMetrics(serviceID, serviceName string) tea.Cmd {
 	c, proj, env := a.client, a.projectID, a.env
@@ -318,6 +349,7 @@ type deploymentsLoadedMsg struct {
 }
 type deployTickMsg struct{}
 type metricsTickMsg struct{}
+type progressTickMsg struct{}
 type metricsLoadedMsg struct {
 	serviceID string
 	metrics   *model.Metrics
@@ -453,6 +485,23 @@ func (a *App) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			}
 			a.status = fmt.Sprintf("streaming deploy logs from %d service(s)", len(a.services))
 		}
+		// Auto-stream build logs for any service that's currently building, so
+		// the progress overlay (and Logs pane) show real build output. Build
+		// streams are one-shot and end on their own when the build finishes.
+		for _, s := range a.services {
+			if s.Status == model.StatusBuilding {
+				bsrc := model.Source{ServiceID: s.ID, ServiceName: s.Name, Environment: a.env, Kind: model.LogBuild}
+				if !a.logMgr.isActive(bsrc.Key()) {
+					a.logMgr.add(bsrc)
+					a.logs.activeKey[bsrc.Key()] = true
+				}
+			}
+		}
+		// Kick off the progress-overlay animation when a deploy is in flight.
+		if !a.progressAnimating && a.hasActiveDeploys() {
+			a.progressAnimating = true
+			cmds = append(cmds, a.progressTick())
+		}
 		// Watcher diff → notifications.
 		for _, note := range a.watcher.onServices(a.services) {
 			cmds = append(cmds, a.notify.push(note))
@@ -480,6 +529,16 @@ func (a *App) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			cmds = append(cmds, a.loadMetrics(a.focusedID, a.focused.Name))
 		}
 		return a, tea.Batch(cmds...)
+
+	case progressTickMsg:
+		a.progressFrame++
+		// Keep animating only while a deploy is in flight; otherwise let the
+		// loop stop so we don't re-render on a timer while idle.
+		if a.hasActiveDeploys() {
+			return a, a.progressTick()
+		}
+		a.progressAnimating = false
+		return a, nil
 
 	case metricsLoadedMsg:
 		a.metrics.setMetrics(m.serviceID, m.metrics)

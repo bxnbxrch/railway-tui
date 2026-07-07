@@ -150,6 +150,17 @@ func (p *logsPane) append(ll model.LogLine) bool {
 	return true
 }
 
+// lastMessageFor returns the most recent buffered log message for a service
+// (any source kind), used by the deploy-progress overlay to show live output.
+func (p *logsPane) lastMessageFor(name string) string {
+	for i := len(p.buf) - 1; i >= 0; i-- {
+		if p.buf[i].Source.ServiceName == name && strings.TrimSpace(p.buf[i].Message) != "" {
+			return p.buf[i].Message
+		}
+	}
+	return ""
+}
+
 // matches applies the current filter string to a line.
 func (p *logsPane) matches(ll model.LogLine) bool {
 	q := strings.TrimSpace(p.filter.Value())

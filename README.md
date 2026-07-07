@@ -38,7 +38,7 @@ go build -o railway-tui ./cmd/railway-tui
 | **Vars** | Environment-variable editor for the focused service (`railway variable`): list (values masked by default, `v` reveals), add a `KEY=value` pair, and delete with confirmation. |
 | **Service** | Focused-service detail: source, status, replicas by region, volumes, and domains. Generate a Railway domain, delete a domain, or open a domain / the service URL in your browser. |
 | **Topology** | Project → environment → service tree with status, replicas, source, and domain. Enter focuses logs, metrics, variables, and the service pane on a service. |
-| **Notifications** | History of deploy/crash/log-error events. Toasts pop over any pane. |
+| **Notifications** | History of deploy/crash/log-error events. Toasts pop over any pane, and a live **deploy-progress overlay** (spinner, phase, elapsed, sweeping bar, latest build line) shows in the bottom-right while any service is building or deploying. |
 | **Settings** | Toggle notification rules, poll intervals, and toast duration in-app (persisted to YAML). |
 
 ## Keys
