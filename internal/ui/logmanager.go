@@ -2,6 +2,7 @@ package ui
 
 import (
 	"context"
+	"strings"
 	"time"
 
 	tea "github.com/charmbracelet/bubbletea"
@@ -11,14 +12,46 @@ import (
 	"railway-tui/internal/railwaycli"
 )
 
+// streamState is the lifecycle of one log-stream source, surfaced in the UI
+// (sidebar icons + status bar) so streaming health is never invisible.
+type streamState int
+
+const (
+	streamOff streamState = iota
+	streamConnecting
+	streamLive
+	streamReconnecting
+	streamFailed
+	streamEnded // one-shot source (build logs) finished
+)
+
+// streamEvent reports a state transition for one source.
+type streamEvent struct {
+	key     string
+	kind    model.LogKind
+	service string
+	state   streamState
+	info    string // short human-readable reason (stderr / error)
+	lines   int    // lines delivered so far (tail + stream), for "ended" feedback
+}
+
+// streamEventMsg carries a streamEvent into the Update loop.
+type streamEventMsg streamEvent
+
+// logBatchMsg carries one or more aggregated log lines into the Update loop.
+// Batching (instead of one message per line) keeps the UI responsive under
+// log floods: the pane re-renders once per batch, not once per line.
+type logBatchMsg []model.LogLine
+
 // logManager supervises N streaming log subprocesses and funnels all their
-// lines into a single aggregator channel. A single re-arming tea.Cmd
-// (waitForLine) drains the aggregator, so both the logs pane and the watcher
-// see every line via the root Update loop.
+// lines into a single aggregator channel, and their health transitions into an
+// events channel. Re-arming tea.Cmds (waitForLines / waitForEvents) drain
+// both, so the panes and the watcher see everything via the root Update loop.
 type logManager struct {
 	client  *railwaycli.Client
 	project string
 	agg     chan model.LogLine
+	events  chan streamEvent
 	streams map[string]*streamHandle
 }
 
@@ -32,17 +65,9 @@ func newLogManager(client *railwaycli.Client, project string) *logManager {
 		client:  client,
 		project: project,
 		agg:     make(chan model.LogLine, 1024),
-		streams: make(map[string]*streamHandle),
+		events:  make(chan streamEvent, 64),
+		streams: map[string]*streamHandle{},
 	}
-}
-
-// active returns the keys of currently-streaming sources.
-func (m *logManager) active() map[string]model.Source {
-	out := make(map[string]model.Source, len(m.streams))
-	for k, h := range m.streams {
-		out[k] = h.src
-	}
-	return out
 }
 
 func (m *logManager) isActive(key string) bool {
@@ -59,7 +84,7 @@ func (m *logManager) add(src model.Source) {
 	dbg.Logf("logmgr ADD source [%s] (project=%q)", key, m.project)
 	ctx, cancel := context.WithCancel(context.Background())
 	m.streams[key] = &streamHandle{src: src, cancel: cancel}
-	go m.pump(ctx, src)
+	go m.pump(ctx, src, m.project)
 }
 
 // remove stops a stream.
@@ -88,21 +113,63 @@ func (m *logManager) stopAll() {
 	}
 }
 
+// emit publishes a state transition (dropped only if the app is shutting down).
+func (m *logManager) emit(ctx context.Context, src model.Source, st streamState, info string, lines int) {
+	ev := streamEvent{
+		key: src.Key(), kind: src.Kind, service: src.ServiceName,
+		state: st, info: shortInfo(info), lines: lines,
+	}
+	select {
+	case m.events <- ev:
+	case <-ctx.Done():
+	}
+}
+
+// shortInfo compresses a stderr/error blob into one short line for the UI.
+func shortInfo(s string) string {
+	s = strings.TrimSpace(s)
+	if i := strings.IndexByte(s, '\n'); i >= 0 {
+		s = strings.TrimSpace(s[:i])
+	}
+	if len(s) > 70 {
+		s = s[:70] + "…"
+	}
+	return s
+}
+
+// tailLines is the history seeded before a live stream attaches. Build logs
+// get a much deeper seed: they're a finite historical record (the interesting
+// part *is* the history), whereas continuous streams only need enough context
+// to not start on an empty pane.
+const (
+	tailLinesLive  = 20
+	tailLinesBuild = 200
+)
+
 // pump seeds recent history (a tail) then keeps a live stream running,
-// silently reconnecting when `railway logs` ends (its stream has a finite
-// server-side lifetime — the cause of logs "randomly stopping"). Reconnects
-// are recorded only to the debug log, never as lines in the pane. Duplicate
+// reconnecting when `railway logs` ends (its stream has a finite server-side
+// lifetime — the cause of logs "randomly stopping"). Every transition is
+// emitted as a streamEvent so the UI can show per-source health. Duplicate
 // lines from tail/reconnect replays are de-duplicated downstream by the pane.
-func (m *logManager) pump(ctx context.Context, src model.Source) {
+func (m *logManager) pump(ctx context.Context, src model.Source, project string) {
+	key := src.Key()
+	m.emit(ctx, src, streamConnecting, "", 0)
+
 	// Seed with recent history so the pane isn't empty before live logs arrive.
+	n := tailLinesLive
+	if src.Kind == model.LogBuild {
+		n = tailLinesBuild
+	}
+	seeded := 0
 	tailCtx, cancelTail := context.WithTimeout(ctx, 20*time.Second)
-	if tail, err := m.client.LogTail(tailCtx, src, m.project, 20); err != nil {
-		dbg.Logf("logmgr TAIL ERR [%s]: %v", src.Key(), err)
+	if tail, err := m.client.LogTail(tailCtx, src, project, n); err != nil {
+		dbg.Logf("logmgr TAIL ERR [%s]: %v", key, err)
 	} else {
-		dbg.Logf("logmgr TAIL [%s]: %d lines", src.Key(), len(tail))
+		dbg.Logf("logmgr TAIL [%s]: %d lines", key, len(tail))
 		for _, ll := range tail {
 			select {
 			case m.agg <- ll:
+				seeded++
 			case <-ctx.Done():
 				cancelTail()
 				return
@@ -113,34 +180,54 @@ func (m *logManager) pump(ctx context.Context, src model.Source) {
 
 	// Build logs are a finite, historical record of a single build that has
 	// already run — not a live stream. Reconnecting after it ends would just
-	// replay the entire build output on a loop (this previously caused the
-	// same build error to flash repeatedly). Run it once and stop.
+	// replay the entire build output on a loop. Run it once and report "ended"
+	// so the sidebar can show it as done (instead of a checkbox that lies).
 	if !isContinuous(src.Kind) {
-		ls, err := m.client.StartLogStream(ctx, src, m.project)
+		ls, err := m.client.StartLogStream(ctx, src, project)
 		if err != nil {
-			dbg.Logf("logmgr STREAM START ERR [%s]: %v (one-shot, not retrying)", src.Key(), err)
+			dbg.Logf("logmgr STREAM START ERR [%s]: %v (one-shot, not retrying)", key, err)
+			m.emit(ctx, src, streamFailed, err.Error(), seeded)
 			return
 		}
-		m.drain(ctx, ls)
-		dbg.Logf("logmgr STREAM DONE [%s] (one-shot; not reconnecting)", src.Key())
+		m.emit(ctx, src, streamLive, "", seeded)
+		got := m.drain(ctx, ls)
+		dbg.Logf("logmgr STREAM DONE [%s] (one-shot; not reconnecting)", key)
+		m.emit(ctx, src, streamEnded, ls.Stderr(), seeded+got)
 		return
 	}
 
 	backoff := time.Second
 	const maxBackoff = 20 * time.Second
+	total := seeded
 	for ctx.Err() == nil {
-		ls, err := m.client.StartLogStream(ctx, src, m.project)
+		ls, err := m.client.StartLogStream(ctx, src, project)
 		if err != nil {
-			dbg.Logf("logmgr STREAM START ERR [%s]: %v (retrying in %s)", src.Key(), err, backoff)
-		} else if m.drain(ctx, ls) {
-			// A stream that delivered data reset the backoff, so a normal
-			// server-side rotation reconnects promptly.
-			backoff = time.Second
+			dbg.Logf("logmgr STREAM START ERR [%s]: %v (retrying in %s)", key, err, backoff)
+			m.emit(ctx, src, streamFailed, err.Error(), total)
+		} else {
+			m.emit(ctx, src, streamLive, "", total)
+			got := m.drain(ctx, ls)
+			total += got
+			if got > 0 {
+				// A stream that delivered data resets the backoff, so a normal
+				// server-side rotation reconnects promptly.
+				backoff = time.Second
+			}
+			if ctx.Err() != nil {
+				return
+			}
+			reason := ls.Stderr()
+			if reason == "" {
+				if e := ls.Err(); e != nil {
+					reason = e.Error()
+				}
+			}
+			m.emit(ctx, src, streamReconnecting, reason, total)
 		}
 		if ctx.Err() != nil {
 			return
 		}
-		dbg.Logf("logmgr RECONNECT [%s] in %s", src.Key(), backoff)
+		dbg.Logf("logmgr RECONNECT [%s] in %s", key, backoff)
 		if !sleepCtx(ctx, backoff) {
 			return
 		}
@@ -160,16 +247,16 @@ func isContinuous(k model.LogKind) bool {
 }
 
 // drain forwards a stream's lines to the aggregator until it ends or ctx is
-// cancelled. Returns true if any line was received (a healthy stream).
-func (m *logManager) drain(ctx context.Context, ls *railwaycli.LogStream) bool {
-	got := false
+// cancelled. Returns the number of lines received.
+func (m *logManager) drain(ctx context.Context, ls *railwaycli.LogStream) int {
+	got := 0
 	for {
 		select {
 		case ll, ok := <-ls.Lines:
 			if !ok {
 				return got
 			}
-			got = true
+			got++
 			select {
 			case m.agg <- ll:
 			case <-ctx.Done():
@@ -193,17 +280,45 @@ func sleepCtx(ctx context.Context, d time.Duration) bool {
 	}
 }
 
-// logLineMsg carries one aggregated line into the Update loop.
-type logLineMsg model.LogLine
+// maxLogBatch caps how many lines a single logBatchMsg carries, so one huge
+// flood can't starve the Update loop.
+const maxLogBatch = 256
 
-// waitForLine returns a tea.Cmd that blocks on the aggregator and re-arms
-// itself after each line (standard Bubble Tea subprocess-streaming pattern).
-func (m *logManager) waitForLine() tea.Cmd {
+// waitForLines returns a tea.Cmd that blocks for the next log line, then
+// greedily drains whatever else is already queued (up to maxLogBatch) into a
+// single batch message. It re-arms after each batch.
+func (m *logManager) waitForLines() tea.Cmd {
+	agg := m.agg
 	return func() tea.Msg {
-		ll, ok := <-m.agg
+		ll, ok := <-agg
 		if !ok {
 			return nil
 		}
-		return logLineMsg(ll)
+		batch := logBatchMsg{ll}
+		for len(batch) < maxLogBatch {
+			select {
+			case l2, ok2 := <-agg:
+				if !ok2 {
+					return batch
+				}
+				batch = append(batch, l2)
+			default:
+				return batch
+			}
+		}
+		return batch
+	}
+}
+
+// waitForEvents returns a tea.Cmd that blocks for the next stream health
+// transition and re-arms after each one.
+func (m *logManager) waitForEvents() tea.Cmd {
+	events := m.events
+	return func() tea.Msg {
+		ev, ok := <-events
+		if !ok {
+			return nil
+		}
+		return streamEventMsg(ev)
 	}
 }

@@ -95,9 +95,10 @@ type App struct {
 	focused   model.Service
 	focusedID string
 
-	logMgr      *logManager
-	watcher     *watcher
-	autoStarted bool // deploy logs auto-enabled on first load
+	logMgr       *logManager
+	watcher      *watcher
+	autoStarted  bool                   // deploy logs auto-enabled on first load
+	streamHealth map[string]streamEvent // latest state per log source (shared with logs pane)
 
 	// deploy-progress overlay animation
 	progressFrame     int
@@ -144,6 +145,7 @@ func New(cfg config.Config, client *railwaycli.Client) *App {
 	a.picker = newPicker(st)
 	a.watcher = newWatcher(cfg.Notifications)
 	a.logMgr = newLogManager(client, cfg.Project)
+	a.streamHealth = a.logs.health // shared map: pane reads what the app updates
 
 	// Apply the active layout.
 	a.applyLayout(cfg.LayoutByName(cfg.ActiveLayout))
@@ -159,6 +161,7 @@ func New(cfg config.Config, client *railwaycli.Client) *App {
 func (a *App) SetLogPath(p string) {
 	a.logPath = p
 	a.settings.logPath = p
+	a.logs.logPath = p
 }
 
 func (a *App) applyLayout(l config.Layout) {
@@ -181,7 +184,8 @@ func (a *App) Init() tea.Cmd {
 		a.loadProjects(),
 		a.loadTopology(),
 		a.loadServices(),
-		a.logMgr.waitForLine(),
+		a.logMgr.waitForLines(),
+		a.logMgr.waitForEvents(),
 		a.deployTick(),
 		a.metricsTick(),
 	)
@@ -402,9 +406,8 @@ func (a *App) switchContext(projectID, projectName, env string) tea.Cmd {
 	a.env = env
 	a.logMgr.stopAll()
 	a.logMgr.project = projectID
-	a.logs.buf = nil
-	a.logs.activeKey = map[string]bool{}
-	a.logs.reflow()
+	a.logs.resetContext()
+	clear(a.streamHealth)
 	a.watcher.lastSeen = map[string]model.DeployStatus{}
 	a.errors.clear()
 	a.focused = model.Service{}
@@ -484,6 +487,12 @@ func (a *App) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				a.logs.activeKey[src.Key()] = true
 			}
 			a.status = fmt.Sprintf("streaming deploy logs from %d service(s)", len(a.services))
+			// A visible toast too, so it's obvious logging has started (and that
+			// build/http sources are opt-in via the sidebar).
+			cmds = append(cmds, a.notify.push(notification{
+				ts: time.Now(), sev: sevInfo, title: "LOGS",
+				body: fmt.Sprintf("streaming deploy logs from %d service(s) — [s]idebar for build/http", len(a.services)),
+			}))
 		}
 		// Auto-stream build logs for any service that's currently building, so
 		// the progress overlay (and Logs pane) show real build output. Build
@@ -592,13 +601,15 @@ func (a *App) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		}
 		return a, nil
 
-	case logLineMsg:
-		ll := model.LogLine(m)
-		isNew := a.logs.append(ll)
-		// Only react to genuinely new lines — a replayed duplicate (from a
-		// tail seed or stream reconnect) must not re-trigger an error entry
-		// or toast every time it reappears.
-		if isNew {
+	case logBatchMsg:
+		for _, ll := range m {
+			isNew := a.logs.append(ll)
+			// Only react to genuinely new lines — a replayed duplicate (from a
+			// tail seed or stream reconnect) must not re-trigger an error entry
+			// or toast every time it reappears.
+			if !isNew {
+				continue
+			}
 			if a.watcher.isError(ll) {
 				a.errors.append(ll)
 			}
@@ -607,15 +618,16 @@ func (a *App) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			}
 		}
 		// Re-arm the pump.
-		cmds = append(cmds, a.logMgr.waitForLine())
+		cmds = append(cmds, a.logMgr.waitForLines())
+		return a, tea.Batch(cmds...)
+
+	case streamEventMsg:
+		cmds = append(cmds, a.onStreamEvent(streamEvent(m))...)
+		cmds = append(cmds, a.logMgr.waitForEvents())
 		return a, tea.Batch(cmds...)
 
 	case toastExpiredMsg:
 		a.notify.sweep()
-		return a, nil
-
-	case sourceToggle:
-		a.logMgr.toggle(m.src)
 		return a, nil
 
 	case pickerChoiceMsg:
@@ -692,6 +704,49 @@ func (a *App) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	// Forward remaining (mouse/tick) to focused pane for viewport etc.
 	cmds = append(cmds, a.routeKey(msg))
 	return a, tea.Batch(cmds...)
+}
+
+// onStreamEvent applies a log-stream health transition: updates the shared
+// health map (sidebar icons), cleans up finished one-shot streams so stream
+// counts stay honest, and surfaces fresh failures as toasts.
+func (a *App) onStreamEvent(ev streamEvent) []tea.Cmd {
+	prev, hadPrev := a.streamHealth[ev.key]
+	a.streamHealth[ev.key] = ev
+	a.logs.dirty = true // health feeds the sidebar and the empty-state text
+	var cmds []tea.Cmd
+	switch ev.state {
+	case streamEnded:
+		// One-shot (build) stream finished: drop the handle and uncheck the
+		// source (its ✓ stays in the sidebar; re-toggling re-runs it).
+		a.logMgr.remove(ev.key)
+		a.logs.activeKey[ev.key] = false
+		if ev.lines > 0 {
+			a.status = fmt.Sprintf("%s: %d lines loaded — merged by time; scroll up or filter @kind:build", ev.key, ev.lines)
+		} else {
+			reason := ev.info
+			if reason == "" {
+				reason = "no output"
+			}
+			a.status = ev.key + ": build stream ended (" + reason + ")"
+		}
+	case streamFailed:
+		if !isContinuous(ev.kind) {
+			a.logMgr.remove(ev.key)
+			a.logs.activeKey[ev.key] = false
+		}
+		// Toast on a fresh failure only — retries that keep failing stay quiet.
+		if (!hadPrev || prev.state != streamFailed) && !a.cfg.Notifications.Muted(ev.service) {
+			body := ev.key
+			if ev.info != "" {
+				body += ": " + ev.info
+			}
+			cmds = append(cmds, a.notify.push(notification{
+				ts: time.Now(), sev: sevWarn, service: ev.service,
+				title: "LOG STREAM FAILED", body: body,
+			}))
+		}
+	}
+	return cmds
 }
 
 // handleErr records an error; auth/link failures are fatal-ish and shown big.

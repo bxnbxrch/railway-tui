@@ -115,8 +115,44 @@ func TestParseProjectRefs(t *testing.T) {
 
 func TestDecodeLogLineHTTP(t *testing.T) {
 	src := model.Source{ServiceName: "api", Kind: model.LogHTTP}
-	ll := decodeLogLine(`{"timestamp":"2026-07-07T14:27:13.879Z","method":"GET","path":"/api/x","httpStatus":200,"totalDuration":42}`, src)
-	if ll.Message == "" || ll.Timestamp.IsZero() {
-		t.Fatalf("http line not summarized: %+v", ll)
+	lls := decodeLogLines(`{"timestamp":"2026-07-07T14:27:13.879Z","method":"GET","path":"/api/x","httpStatus":200,"totalDuration":42}`, src)
+	if len(lls) != 1 {
+		t.Fatalf("want 1 line, got %d", len(lls))
+	}
+	if lls[0].Message == "" || lls[0].Timestamp.IsZero() {
+		t.Fatalf("http line not summarized: %+v", lls[0])
+	}
+}
+
+// TestDecodeLogLineMultiline verifies that a build-style message with a
+// trailing newline and embedded newlines is split into one LogLine per row,
+// each with a distinct timestamp (so replay dedup can't swallow rows).
+func TestDecodeLogLineMultiline(t *testing.T) {
+	src := model.Source{ServiceName: "api", Kind: model.LogBuild}
+	lls := decodeLogLines(`{"timestamp":"2026-07-07T14:27:13.879Z","level":"info","message":"warn:\n- first\n- second\n"}`, src)
+	if len(lls) != 3 {
+		t.Fatalf("want 3 split lines, got %d: %+v", len(lls), lls)
+	}
+	want := []string{"warn:", "- first", "- second"}
+	for i, w := range want {
+		if lls[i].Message != w {
+			t.Errorf("row %d: want %q got %q", i, w, lls[i].Message)
+		}
+	}
+	if !lls[1].Timestamp.After(lls[0].Timestamp) || !lls[2].Timestamp.After(lls[1].Timestamp) {
+		t.Errorf("split rows must have strictly increasing timestamps")
+	}
+	if lls[0].Level != "info" || lls[2].Level != "info" {
+		t.Errorf("split rows must inherit level")
+	}
+}
+
+// TestDecodeLogLineTrailingNewline verifies single-row messages lose their
+// trailing newline (which previously rendered as blank rows in the pane).
+func TestDecodeLogLineTrailingNewline(t *testing.T) {
+	src := model.Source{ServiceName: "api", Kind: model.LogBuild}
+	lls := decodeLogLines(`{"timestamp":"2026-07-07T14:27:13.879Z","message":"built in 3.37s\n"}`, src)
+	if len(lls) != 1 || lls[0].Message != "built in 3.37s" {
+		t.Fatalf("trailing newline not trimmed: %+v", lls)
 	}
 }

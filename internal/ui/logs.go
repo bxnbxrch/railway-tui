@@ -22,18 +22,24 @@ type logsPane struct {
 	vp     viewport.Model
 	filter textinput.Model
 
-	buf      []model.LogLine     // time-ordered ring buffer
-	rendered []string            // cached rendered lines parallel to filtered view
-	seen     map[string]struct{} // recent line fingerprints for de-duplication
-	seenRing []string            // insertion order for evicting old fingerprints
+	buf         []model.LogLine     // time-ordered ring buffer
+	renderedAll []string            // cached rendered rows, parallel to buf
+	dirty       bool                // viewport content needs a rebuild
+	seen        map[string]struct{} // recent line fingerprints for de-duplication
+	seenRing    []string            // insertion order for evicting old fingerprints
 
 	// available sources come from the topology; toggled ones stream.
 	sources   []model.Source
-	activeKey map[string]bool // key -> streaming
+	activeKey map[string]bool // key -> user wants it streaming
+
+	// health/liveness, so "is it working?" is answerable at a glance.
+	health map[string]streamEvent // key -> latest stream state (shared with App)
+	counts map[string]int         // key -> lines received this session
+
+	logPath string // debug log location, shown when streams fail
 
 	filtering   bool
 	showSidebar bool
-	split       bool // future: merged vs per-source columns
 	autoscroll  bool
 	cursor      int // sidebar cursor
 
@@ -43,12 +49,14 @@ type logsPane struct {
 
 func newLogsPane(styles *theme.Styles) *logsPane {
 	fi := textinput.New()
-	fi.Placeholder = "filter (text, or @level:error / [service])"
+	fi.Placeholder = "filter (text, @level:error, @kind:build, [service])"
 	fi.Prompt = "/"
 	return &logsPane{
 		styles:      styles,
 		filter:      fi,
 		activeKey:   map[string]bool{},
+		health:      map[string]streamEvent{},
+		counts:      map[string]int{},
 		seen:        map[string]struct{}{},
 		showSidebar: true,
 		autoscroll:  true,
@@ -62,7 +70,7 @@ const seenCap = 2000
 // and message), recording it if not. This absorbs the overlap between the
 // historical tail, the live stream, and reconnect replays.
 func (p *logsPane) dupe(ll model.LogLine) bool {
-	fp := ll.Source.Key() + "|" + ll.Timestamp.Format("15:04:05.000000") + "|" + ll.Message
+	fp := ll.Source.Key() + "|" + ll.Timestamp.Format("15:04:05.000000000") + "|" + ll.Message
 	if _, ok := p.seen[fp]; ok {
 		return true
 	}
@@ -119,10 +127,24 @@ func (p *logsPane) setSources(srcs []model.Source) {
 	}
 }
 
+// resetContext clears everything tied to the current project/environment
+// (used when switching context).
+func (p *logsPane) resetContext() {
+	p.buf = nil
+	p.renderedAll = nil
+	p.seen = map[string]struct{}{}
+	p.seenRing = nil
+	p.counts = map[string]int{}
+	p.activeKey = map[string]bool{}
+	p.dirty = true
+}
+
 // append inserts a line, keeping the buffer roughly time-ordered and capped.
-// Returns false if the line was dropped as a replayed duplicate (tail/stream/
-// reconnect overlap) — callers should skip error/notification handling for
-// dropped lines so a replay flood can't repeatedly re-trigger them.
+// The rendered-row cache is updated in lockstep, so appending is O(window)
+// instead of re-rendering the whole buffer (which made the UI lag under any
+// real log volume). Returns false if the line was dropped as a replayed
+// duplicate — callers should skip error/notification handling for dropped
+// lines so a replay flood can't repeatedly re-trigger them.
 func (p *logsPane) append(ll model.LogLine) bool {
 	if !ll.Timestamp.IsZero() && p.dupe(ll) {
 		return false
@@ -142,11 +164,17 @@ func (p *logsPane) append(ll model.LogLine) bool {
 	p.buf = append(p.buf, model.LogLine{})
 	copy(p.buf[i+1:], p.buf[i:])
 	p.buf[i] = ll
+	p.renderedAll = append(p.renderedAll, "")
+	copy(p.renderedAll[i+1:], p.renderedAll[i:])
+	p.renderedAll[i] = p.renderLine(ll)
 
 	if len(p.buf) > logBufferCap {
 		p.buf = p.buf[len(p.buf)-logBufferCap:]
+		p.renderedAll = p.renderedAll[len(p.renderedAll)-logBufferCap:]
 	}
-	p.reflow()
+
+	p.counts[ll.Source.Key()]++
+	p.dirty = true
 	return true
 }
 
@@ -178,20 +206,28 @@ func (p *logsPane) matches(ll model.LogLine) bool {
 		want := strings.TrimPrefix(lq, "@level:")
 		return strings.EqualFold(ll.Level, want)
 	}
+	// @kind:x filter (deploy/build/http/network) — the quick way to see just
+	// build output after toggling a build source on.
+	if strings.HasPrefix(lq, "@kind:") {
+		want := strings.TrimPrefix(lq, "@kind:")
+		return strings.EqualFold(string(ll.Source.Kind), want)
+	}
 	return strings.Contains(strings.ToLower(ll.Message), lq) ||
 		strings.Contains(strings.ToLower(ll.Level), lq) ||
 		strings.Contains(strings.ToLower(ll.Source.Label()), lq)
 }
 
-func (p *logsPane) reflow() {
+// sync rebuilds the viewport content from the cached rendered rows (cheap: a
+// filter pass + join, no re-styling). Called lazily from View when dirty.
+func (p *logsPane) sync() {
+	p.dirty = false
 	lines := make([]string, 0, len(p.buf))
-	for _, ll := range p.buf {
+	for i, ll := range p.buf {
 		if !p.matches(ll) {
 			continue
 		}
-		lines = append(lines, p.renderLine(ll))
+		lines = append(lines, p.renderedAll[i])
 	}
-	p.rendered = lines
 	content := strings.Join(lines, "\n")
 	if len(lines) == 0 {
 		content = p.emptyState()
@@ -202,23 +238,63 @@ func (p *logsPane) reflow() {
 	}
 }
 
-// emptyState explains why no log lines are showing.
+// reflow fully re-renders every cached row (needed when the pane width
+// changes) and then syncs the viewport.
+func (p *logsPane) reflow() {
+	p.renderedAll = make([]string, len(p.buf))
+	for i, ll := range p.buf {
+		p.renderedAll[i] = p.renderLine(ll)
+	}
+	p.sync()
+}
+
+// emptyState explains why no log lines are showing — using real stream health
+// so a failing stream can never masquerade as "waiting for logs".
 func (p *logsPane) emptyState() string {
-	active := 0
-	for _, on := range p.activeKey {
-		if on {
-			active++
+	active, live, conn, failed := 0, 0, 0, 0
+	firstErr := ""
+	for key, on := range p.activeKey {
+		if !on {
+			continue
+		}
+		active++
+		ev, ok := p.health[key]
+		if !ok {
+			conn++
+			continue
+		}
+		switch ev.state {
+		case streamLive:
+			live++
+		case streamConnecting, streamReconnecting:
+			conn++
+		case streamFailed:
+			failed++
+			if firstErr == "" && ev.info != "" {
+				firstErr = ev.info
+			}
 		}
 	}
 	switch {
 	case len(p.buf) > 0:
-		return p.styles.Dim.Render("No lines match the current filter (" + p.filter.Value() + ").")
+		return p.styles.Dim.Render("No lines match the current filter (" + p.filter.Value() + ").\n\nPress / then esc to clear it.")
 	case active == 0:
 		return p.styles.Dim.Render("No log sources selected.\n\n" +
 			"Toggle a service in the sidebar with [enter], or focus one from the Topology pane.")
+	case failed == active:
+		msg := "All " + itoaLocal(active) + " log stream(s) are failing."
+		if firstErr != "" {
+			msg += "\n\n" + firstErr
+		}
+		if p.logPath != "" {
+			msg += "\n\nDetails: " + p.logPath
+		}
+		return lipgloss.NewStyle().Foreground(p.styles.T.Bad).Render(msg)
+	case live == 0:
+		return p.styles.Dim.Render("Connecting to " + itoaLocal(conn) + " log stream(s)…")
 	default:
-		return p.styles.Dim.Render("Waiting for logs from " + itoaLocal(active) + " source(s)…\n\n" +
-			"(streaming; nothing has been emitted yet)")
+		return p.styles.Dim.Render(itoaLocal(live) + " stream(s) connected — waiting for output.\n\n" +
+			"(the services are quiet; lines appear the moment they log)")
 	}
 }
 
@@ -234,6 +310,35 @@ func itoaLocal(n int) string {
 		n /= 10
 	}
 	return string(buf[i:])
+}
+
+// compactCount formats a line count for the narrow sidebar (1234 -> "1.2k").
+func compactCount(n int) string {
+	switch {
+	case n >= 100000:
+		return itoaLocal(n/1000) + "k"
+	case n >= 1000:
+		return itoaLocal(n/1000) + "." + itoaLocal((n%1000)/100) + "k"
+	default:
+		return itoaLocal(n)
+	}
+}
+
+// iconFor maps a stream state to its sidebar glyph.
+func iconFor(st streamState) string {
+	switch st {
+	case streamLive:
+		return "●"
+	case streamConnecting:
+		return "◌"
+	case streamReconnecting:
+		return "↻"
+	case streamFailed:
+		return "✖"
+	case streamEnded:
+		return "✓"
+	}
+	return "○"
 }
 
 func (p *logsPane) renderLine(ll model.LogLine) string {
@@ -291,13 +396,19 @@ func (p *logsPane) Update(msg tea.Msg) (tea.Cmd, *sourceToggle) {
 	case tea.KeyMsg:
 		if p.filtering {
 			switch m.String() {
-			case "enter", "esc":
+			case "enter":
 				p.filtering = false
 				p.filter.Blur()
-				p.reflow()
+				p.sync()
+			case "esc":
+				// esc cancels: clear the filter and leave filter mode.
+				p.filter.SetValue("")
+				p.filtering = false
+				p.filter.Blur()
+				p.sync()
 			default:
 				p.filter, cmd = p.filter.Update(msg)
-				p.reflow()
+				p.sync()
 			}
 			return cmd, nil
 		}
@@ -306,18 +417,28 @@ func (p *logsPane) Update(msg tea.Msg) (tea.Cmd, *sourceToggle) {
 			p.filtering = true
 			p.filter.Focus()
 			return textinput.Blink, nil
+		case "esc":
+			if p.filter.Value() != "" {
+				p.filter.SetValue("")
+				p.sync()
+			}
+			return nil, nil
 		case "s":
 			p.showSidebar = !p.showSidebar
 			p.setSize(p.width, p.height)
 			return nil, nil
 		case "a":
 			p.autoscroll = !p.autoscroll
+			if p.autoscroll {
+				p.vp.GotoBottom()
+			}
 			return nil, nil
 		case "c":
 			p.buf = nil
+			p.renderedAll = nil
 			p.seen = map[string]struct{}{}
 			p.seenRing = nil
-			p.reflow()
+			p.sync()
 			return nil, nil
 		case "up", "k":
 			if p.showSidebar {
@@ -353,6 +474,9 @@ type sourceToggle struct {
 }
 
 func (p *logsPane) View() string {
+	if p.dirty {
+		p.sync()
+	}
 	logView := p.vp.View()
 	filterLine := ""
 	if p.filtering {
@@ -363,9 +487,9 @@ func (p *logsPane) View() string {
 		if !p.autoscroll {
 			scroll = "SCROLL"
 		}
-		hint := "[/]filter [s]ources [a]utoscroll [c]lear"
+		hint := "[/]filter [s]ources [a]tail [c]lear"
 		if q != "" {
-			hint = "filter: " + q + "  " + hint
+			hint = "filter: " + q + " (esc clears)  " + hint
 		}
 		filterLine = p.styles.Help.Render(hint + "  " + scroll)
 	}
@@ -382,6 +506,37 @@ func (p *logsPane) View() string {
 	return lipgloss.JoinHorizontal(lipgloss.Top, p.sidebar(), " ", body)
 }
 
+// sourceIcon picks the health glyph and its color for one source row.
+func (p *logsPane) sourceIcon(key string) (string, lipgloss.Style) {
+	good := lipgloss.NewStyle().Foreground(p.styles.T.Good)
+	warn := lipgloss.NewStyle().Foreground(p.styles.T.Warn)
+	bad := lipgloss.NewStyle().Foreground(p.styles.T.Bad)
+
+	ev, hasEv := p.health[key]
+	if !p.activeKey[key] {
+		// A finished one-shot (build) keeps its ✓ so "it ran" stays visible.
+		if hasEv && ev.state == streamEnded {
+			return iconFor(streamEnded), good
+		}
+		return iconFor(streamOff), p.styles.Dim
+	}
+	if !hasEv {
+		return iconFor(streamConnecting), warn
+	}
+	switch ev.state {
+	case streamLive:
+		return iconFor(streamLive), good
+	case streamReconnecting:
+		return iconFor(streamReconnecting), warn
+	case streamFailed:
+		return iconFor(streamFailed), bad
+	case streamEnded:
+		return iconFor(streamEnded), good
+	default:
+		return iconFor(streamConnecting), warn
+	}
+}
+
 func (p *logsPane) sidebar() string {
 	w := p.sidebarWidth()
 	var b strings.Builder
@@ -389,24 +544,48 @@ func (p *logsPane) sidebar() string {
 	b.WriteString("\n")
 
 	for i, src := range p.sources {
-		box := "☐"
-		if p.activeKey[src.Key()] {
-			box = "☑"
-		}
+		key := src.Key()
+		icon, iconStyle := p.sourceIcon(key)
 		label := src.Label()
 		if src.Kind != model.LogDeploy {
 			label += " " + string(src.Kind)
 		}
-		line := box + " " + label
-		// Display-width aware clamp (label has no ANSI yet).
-		line = ansi.Truncate(line, w, "…")
-		style := lipgloss.NewStyle().Foreground(p.styles.T.SourceColor(src.Label()))
-		if i == p.cursor {
-			style = style.Background(p.styles.T.BorderCol).Bold(true)
+		count := ""
+		if c := p.counts[key]; c > 0 {
+			count = compactCount(c)
 		}
-		b.WriteString(style.Render(line))
+		// Row layout: icon + space + label … right-aligned count.
+		avail := w - 2 - lipgloss.Width(count)
+		if count != "" {
+			avail-- // gap before count
+		}
+		if avail < 3 {
+			avail = 3
+		}
+		label = ansi.Truncate(label, avail, "…")
+		pad := w - 2 - lipgloss.Width(label) - lipgloss.Width(count)
+		if pad < 0 {
+			pad = 0
+		}
+		if i == p.cursor {
+			line := ansi.Truncate(icon+" "+label+strings.Repeat(" ", pad)+count, w, "…")
+			style := lipgloss.NewStyle().Foreground(p.styles.T.SourceColor(src.Label())).
+				Background(p.styles.T.BorderCol).Bold(true)
+			b.WriteString(style.Render(line))
+		} else {
+			lbl := lipgloss.NewStyle().Foreground(p.styles.T.SourceColor(src.Label())).Render(label + strings.Repeat(" ", pad))
+			b.WriteString(iconStyle.Render(icon) + " " + lbl + p.styles.Dim.Render(count))
+		}
 		b.WriteString("\n")
 	}
+	// One-line legend so the icons are self-explanatory.
+	legend := "● live ◌ conn ↻ retry"
+	legend2 := "✖ fail ✓ done ○ off"
+	b.WriteString("\n")
+	b.WriteString(p.styles.Dim.Render(ansi.Truncate(legend, w, "")))
+	b.WriteString("\n")
+	b.WriteString(p.styles.Dim.Render(ansi.Truncate(legend2, w, "")))
+
 	content := b.String()
 	// Border adds 2 rows; keep the whole block the same height as the pane.
 	innerH := p.height - 2

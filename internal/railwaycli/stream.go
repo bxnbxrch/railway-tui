@@ -6,20 +6,23 @@ import (
 	"encoding/json"
 	"os/exec"
 	"strings"
+	"time"
 
 	"railway-tui/internal/dbg"
 	"railway-tui/internal/model"
 )
 
-// LogStream is a long-lived `railway logs -f --json` subprocess for one source.
-// Lines are decoded and pushed onto Lines; process exit closes Lines and the
-// final error (if any) is available via Err after Lines drains.
+// LogStream is a long-lived `railway logs --json` subprocess for one source
+// (the CLI streams by default). Lines are decoded and pushed onto Lines;
+// process exit closes Lines and the final error (if any) is available via Err
+// after Lines drains.
 type LogStream struct {
 	Source model.Source
 
 	cmd   *exec.Cmd
 	Lines chan model.LogLine
 	errMu chan error // buffered(1); holds terminal error
+	errb  strings.Builder
 }
 
 // StartLogStream launches a streaming logs subprocess for the given source.
@@ -47,18 +50,16 @@ func (c *Client) StartLogStream(ctx context.Context, src model.Source, project s
 		dbg.Logf("stream PIPE ERR [%s]: %v", src.Key(), err)
 		return nil, err
 	}
-	var errb strings.Builder
-	cmd.Stderr = &lineCollector{b: &errb}
-	if err := cmd.Start(); err != nil {
-		dbg.Logf("stream START ERR [%s]: %v", src.Key(), err)
-		return nil, err
-	}
-
 	ls := &LogStream{
 		Source: src,
 		cmd:    cmd,
 		Lines:  make(chan model.LogLine, 256),
 		errMu:  make(chan error, 1),
+	}
+	cmd.Stderr = &lineCollector{b: &ls.errb}
+	if err := cmd.Start(); err != nil {
+		dbg.Logf("stream START ERR [%s]: %v", src.Key(), err)
+		return nil, err
 	}
 
 	go func() {
@@ -75,16 +76,17 @@ func (c *Client) StartLogStream(ctx context.Context, src model.Source, project s
 			if n == 1 {
 				dbg.Logf("stream FIRST LINE [%s]", src.Key())
 			}
-			ll := decodeLogLine(line, src)
-			select {
-			case ls.Lines <- ll:
-			case <-ctx.Done():
-				dbg.Logf("stream CANCELLED [%s] after %d lines", src.Key(), n)
-				return
+			for _, ll := range decodeLogLines(line, src) {
+				select {
+				case ls.Lines <- ll:
+				case <-ctx.Done():
+					dbg.Logf("stream CANCELLED [%s] after %d lines", src.Key(), n)
+					return
+				}
 			}
 		}
 		waitErr := cmd.Wait()
-		stderr := strings.TrimSpace(errb.String())
+		stderr := strings.TrimSpace(ls.errb.String())
 		dbg.Logf("stream ENDED [%s]: %d lines, err=%v stderr=%q", src.Key(), n, waitErr, stderr)
 		select {
 		case ls.errMu <- waitErr:
@@ -105,6 +107,10 @@ func (c *lineCollector) Write(p []byte) (int, error) {
 	return len(p), nil
 }
 
+// Stderr returns the subprocess's captured stderr, complete once Lines has
+// closed. It is the best human-readable reason for why a stream ended.
+func (ls *LogStream) Stderr() string { return strings.TrimSpace(ls.errb.String()) }
+
 // Err returns the terminal error after Lines has closed (nil if clean exit or
 // still running).
 func (ls *LogStream) Err() error {
@@ -116,12 +122,16 @@ func (ls *LogStream) Err() error {
 	}
 }
 
-// decodeLogLine parses one JSON log line. Non-JSON lines (rare, e.g. CLI
-// banners) are wrapped as a plain message so nothing is silently dropped.
-func decodeLogLine(line string, src model.Source) model.LogLine {
+// decodeLogLines parses one JSON log line into one or more LogLines. Non-JSON
+// lines (rare, e.g. CLI banners) are wrapped as a plain message so nothing is
+// silently dropped. Railway messages — especially build logs — often carry
+// trailing and embedded newlines (multi-line compiler warnings etc.); those
+// are split into separate LogLines so the one-row-per-line pane renders them
+// correctly instead of producing blank/mangled rows.
+func decodeLogLines(line string, src model.Source) []model.LogLine {
 	var generic map[string]any
 	if err := json.Unmarshal([]byte(line), &generic); err != nil {
-		return model.LogLine{Source: src, Message: line}
+		return []model.LogLine{{Source: src, Message: line}}
 	}
 	ll := model.LogLine{Source: src, Attrs: generic}
 	if v, ok := generic["timestamp"].(string); ok {
@@ -140,7 +150,30 @@ func decodeLogLine(line string, src model.Source) model.LogLine {
 	if ll.Message == "" && src.Kind == model.LogNetwork {
 		ll.Message = netSummary(generic)
 	}
-	return ll
+
+	msg := strings.TrimRight(ll.Message, "\r\n")
+	if !strings.Contains(msg, "\n") {
+		ll.Message = msg
+		return []model.LogLine{ll}
+	}
+	parts := strings.Split(msg, "\n")
+	out := make([]model.LogLine, 0, len(parts))
+	for i, part := range parts {
+		part = strings.TrimRight(part, "\r")
+		if strings.TrimSpace(part) == "" {
+			continue
+		}
+		cp := ll
+		cp.Message = part
+		// Offset each split row by 1ns: ordering is preserved, and the pane's
+		// replay de-duplication (keyed on source+time+message) still works
+		// without swallowing identical repeated rows within one message.
+		if !cp.Timestamp.IsZero() {
+			cp.Timestamp = ll.Timestamp.Add(time.Duration(i))
+		}
+		out = append(out, cp)
+	}
+	return out
 }
 
 func str(m map[string]any, k string) string {

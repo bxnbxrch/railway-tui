@@ -111,6 +111,14 @@ func (a *App) routeKey(msg tea.Msg) tea.Cmd {
 		cmd, toggle := a.logs.Update(msg)
 		if toggle != nil {
 			a.logMgr.toggle(toggle.src)
+			if toggle.on {
+				a.status = "starting " + toggle.src.Key() + "…"
+			} else {
+				// Forget the source's health so it shows as plain "off".
+				delete(a.streamHealth, toggle.src.Key())
+				a.status = "stopped " + toggle.src.Key()
+			}
+			a.logs.dirty = true
 		}
 		return cmd
 	case paneErrors:
@@ -316,8 +324,44 @@ func (a *App) renderBody() string {
 	return lipgloss.JoinHorizontal(lipgloss.Top, left, " ", right)
 }
 
+// streamSummary condenses per-source health into a short always-visible
+// status-bar fragment, e.g. "logs ●3" or "logs ●2 ↻1 ✖1".
+func (a *App) streamSummary() string {
+	live, conn, fail := 0, 0, 0
+	for k, on := range a.logs.activeKey {
+		if !on {
+			continue
+		}
+		ev, ok := a.streamHealth[k]
+		switch {
+		case !ok, ev.state == streamConnecting:
+			conn++
+		case ev.state == streamLive:
+			live++
+		case ev.state == streamReconnecting:
+			conn++
+		case ev.state == streamFailed:
+			fail++
+		}
+	}
+	if live+conn+fail == 0 {
+		return "logs: off"
+	}
+	s := "logs"
+	if live > 0 {
+		s += fmt.Sprintf(" ●%d", live)
+	}
+	if conn > 0 {
+		s += fmt.Sprintf(" ◌%d", conn)
+	}
+	if fail > 0 {
+		s += fmt.Sprintf(" ✖%d", fail)
+	}
+	return s
+}
+
 func (a *App) renderStatus() string {
-	left := fmt.Sprintf("%d stream(s)", len(a.logMgr.streams))
+	left := a.streamSummary()
 	if a.status != "" {
 		left += " · " + a.status
 	}

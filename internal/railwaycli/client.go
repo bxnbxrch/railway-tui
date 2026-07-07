@@ -209,7 +209,7 @@ func (c *Client) LogTail(ctx context.Context, src model.Source, project string, 
 		if strings.TrimSpace(raw) == "" {
 			continue
 		}
-		lines = append(lines, decodeLogLine(raw, src))
+		lines = append(lines, decodeLogLines(raw, src)...)
 	}
 	return lines, nil
 }
