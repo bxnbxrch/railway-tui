@@ -9,3 +9,6 @@
 # Editor/OS cruft
 .DS_Store
 *.swp
+
+# Windows build backup artifacts
+*.exe~
