@@ -196,7 +196,7 @@ func (p *metricsPane) View() string {
 		head += p.styles.Dim.Render("   " + p.fetchedAt.Local().Format("15:04:05"))
 	}
 	help := p.styles.Help.Render("[r]efresh · ↑↓ scroll · window: last 1h")
-	return lipgloss.JoinVertical(lipgloss.Left, head, p.vp.View(), help)
+	return clampBlock(lipgloss.JoinVertical(lipgloss.Left, head, p.vp.View(), help), p.width)
 }
 
 // --- value formatting ---

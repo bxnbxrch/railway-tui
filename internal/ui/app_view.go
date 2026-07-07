@@ -380,6 +380,22 @@ func ansiTruncate(s string, w int) string {
 	return string(runes)
 }
 
+// clampBlock truncates every line of s to display width w, so a pane's own
+// View never overflows its box regardless of how it's composed (the outer
+// paneView also clamps, but self-clipping keeps panes correct standalone).
+func clampBlock(s string, w int) string {
+	if w <= 0 {
+		return s
+	}
+	lines := strings.Split(s, "\n")
+	for i, ln := range lines {
+		if lipgloss.Width(ln) > w {
+			lines[i] = ansi.Truncate(ln, w, "…")
+		}
+	}
+	return strings.Join(lines, "\n")
+}
+
 func stripANSI(s string) string {
 	var b strings.Builder
 	inEsc := false

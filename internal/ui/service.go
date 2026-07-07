@@ -308,7 +308,7 @@ func (p *servicePane) View() string {
 			foot = p.styles.ToastWarn.Render(fmt.Sprintf(" DELETE domain %s?  [y/N] ", d.Domain))
 		}
 	}
-	return lipgloss.JoinVertical(lipgloss.Left, head, p.vp.View(), foot)
+	return clampBlock(lipgloss.JoinVertical(lipgloss.Left, head, p.vp.View(), foot), p.width)
 }
 
 // humanMB renders "used / size" for a volume in MB/GB.

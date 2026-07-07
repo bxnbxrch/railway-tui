@@ -307,7 +307,7 @@ func (p *varsPane) View() string {
 	} else if p.errMsg != "" && len(p.vars) > 0 {
 		foot = lipgloss.NewStyle().Foreground(p.styles.T.Bad).Render(p.errMsg)
 	}
-	return lipgloss.JoinVertical(lipgloss.Left, head, p.vp.View(), foot)
+	return clampBlock(lipgloss.JoinVertical(lipgloss.Left, head, p.vp.View(), foot), p.width)
 }
 
 // splitKV parses "KEY=value" into its parts (splitting on the first '=').
