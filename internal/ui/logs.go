@@ -120,10 +120,15 @@ func (p *logsPane) setSources(srcs []model.Source) {
 }
 
 // append inserts a line, keeping the buffer roughly time-ordered and capped.
-// Returns false if the line was dropped as a replayed duplicate (tail/stream/
-// reconnect overlap) — callers should skip error/notification handling for
-// dropped lines so a replay flood can't repeatedly re-trigger them.
+// Returns false if the line was dropped — either as a replayed duplicate
+// (tail/stream/reconnect overlap) or because its source has since been
+// disabled (a line already in flight when the stream was cancelled) —
+// callers should skip error/notification handling for dropped lines so a
+// replay flood, or a stale line from a disabled source, can't re-trigger them.
 func (p *logsPane) append(ll model.LogLine) bool {
+	if !p.activeKey[ll.Source.Key()] {
+		return false
+	}
 	if !ll.Timestamp.IsZero() && p.dupe(ll) {
 		return false
 	}
@@ -148,6 +153,31 @@ func (p *logsPane) append(ll model.LogLine) bool {
 	}
 	p.reflow()
 	return true
+}
+
+// purgeSource removes all buffered lines for a source (and its dedup
+// fingerprints), used when a source is disabled so its past output
+// disappears immediately rather than lingering in the pane.
+func (p *logsPane) purgeSource(key string) {
+	kept := p.buf[:0]
+	for _, ll := range p.buf {
+		if ll.Source.Key() != key {
+			kept = append(kept, ll)
+		}
+	}
+	p.buf = kept
+	// Drop this source's fingerprints too, so re-enabling it later shows its
+	// (now-fresh) tail instead of treating identical history as duplicates.
+	filtered := p.seenRing[:0]
+	for _, fp := range p.seenRing {
+		if strings.HasPrefix(fp, key+"|") {
+			delete(p.seen, fp)
+		} else {
+			filtered = append(filtered, fp)
+		}
+	}
+	p.seenRing = filtered
+	p.reflow()
 }
 
 // matches applies the current filter string to a line.

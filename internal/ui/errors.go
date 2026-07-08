@@ -55,6 +55,19 @@ func (p *errorsPane) clear() {
 	p.reflow()
 }
 
+// purgeSource removes all buffered error entries for a source, used when a
+// source is disabled so its errors disappear immediately.
+func (p *errorsPane) purgeSource(key string) {
+	kept := p.buf[:0]
+	for _, ll := range p.buf {
+		if ll.Source.Key() != key {
+			kept = append(kept, ll)
+		}
+	}
+	p.buf = kept
+	p.reflow()
+}
+
 func (p *errorsPane) Update(msg tea.Msg) tea.Cmd {
 	if km, ok := msg.(tea.KeyMsg); ok && km.String() == "c" {
 		p.clear()

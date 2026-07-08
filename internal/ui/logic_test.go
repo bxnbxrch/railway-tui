@@ -54,6 +54,7 @@ func TestLogFilter(t *testing.T) {
 
 func TestLogAppendOrdersByTime(t *testing.T) {
 	p := newLogsPane(theme.NewStyles(theme.Default()))
+	p.activeKey[model.Source{}.Key()] = true
 	base := time.Date(2026, 7, 7, 12, 0, 0, 0, time.UTC)
 	// Insert out of order; buffer should end sorted.
 	p.append(model.LogLine{Timestamp: base.Add(2 * time.Second), Message: "c"})

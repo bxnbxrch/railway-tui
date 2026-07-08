@@ -37,6 +37,7 @@ func TestAppendReturnsFalseOnDuplicate(t *testing.T) {
 		Level:     "error",
 		Message:   "No package manager could be inferred",
 	}
+	p.activeKey[ll.Source.Key()] = true
 	if ok := p.append(ll); !ok {
 		t.Fatal("first append should report true (new line)")
 	}

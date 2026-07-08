@@ -29,10 +29,12 @@ func TestSplitLayoutNoOverflow(t *testing.T) {
 		{ServiceName: "unity-backend", Environment: "dev", Kind: model.LogDeploy},
 		{ServiceName: "Database", Environment: "dev", Kind: model.LogDeploy},
 	})
+	deploySrc := model.Source{ServiceName: "unity-backend", Environment: "dev", Kind: model.LogDeploy}
+	app.logs.activeKey[deploySrc.Key()] = true
 	base := time.Date(2026, 7, 7, 12, 0, 0, 0, time.UTC)
 	for i := 0; i < 30; i++ {
 		app.logs.append(model.LogLine{
-			Source:    model.Source{ServiceName: "unity-backend", Environment: "dev", Kind: model.LogDeploy},
+			Source:    deploySrc,
 			Timestamp: base.Add(time.Duration(i) * time.Second),
 			Level:     "info",
 			Message:   strings.Repeat("a long log line that must be clipped inside the split column ", 4),

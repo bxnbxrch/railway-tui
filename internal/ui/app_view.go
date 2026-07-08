@@ -98,6 +98,11 @@ func (a *App) routeKey(msg tea.Msg) tea.Cmd {
 		cmd, toggle := a.logs.Update(msg)
 		if toggle != nil {
 			a.logMgr.toggle(toggle.src)
+			if !toggle.on {
+				key := toggle.src.Key()
+				a.logs.purgeSource(key)
+				a.errors.purgeSource(key)
+			}
 		}
 		return cmd
 	case paneErrors:

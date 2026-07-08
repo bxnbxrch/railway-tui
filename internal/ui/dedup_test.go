@@ -18,6 +18,7 @@ func TestLogDedup(t *testing.T) {
 		Timestamp: ts,
 		Message:   "started",
 	}
+	p.activeKey[ll.Source.Key()] = true
 	p.append(ll)
 	p.append(ll) // replayed identical line
 	p.append(ll)

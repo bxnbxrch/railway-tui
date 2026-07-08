@@ -364,10 +364,6 @@ func (a *App) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		a.notify.sweep()
 		return a, nil
 
-	case sourceToggle:
-		a.logMgr.toggle(m.src)
-		return a, nil
-
 	case pickerChoiceMsg:
 		cmds = append(cmds, a.switchContext(m.project.ID, m.project.Name, m.env.Name))
 		return a, tea.Batch(cmds...)

@@ -22,10 +22,12 @@ func TestLogsPaneNoOverflow(t *testing.T) {
 		{ServiceName: "unity-backend", Environment: "dev", Kind: model.LogHTTP},
 		{ServiceName: "Database", Environment: "dev", Kind: model.LogDeploy},
 	})
+	deploySrc := model.Source{ServiceName: "unity-backend", Environment: "dev", Kind: model.LogDeploy}
+	p.activeKey[deploySrc.Key()] = true
 	base := time.Date(2026, 7, 7, 12, 0, 0, 0, time.UTC)
 	for i := 0; i < 40; i++ {
 		p.append(model.LogLine{
-			Source:    model.Source{ServiceName: "unity-backend", Environment: "dev", Kind: model.LogDeploy},
+			Source:    deploySrc,
 			Timestamp: base.Add(time.Duration(i) * time.Second),
 			Level:     "info",
 			Message:   strings.Repeat("this is a very long log line that should be clipped ", 6),
@@ -50,8 +52,10 @@ func TestLogsPaneNarrow(t *testing.T) {
 	p.setSources([]model.Source{
 		{ServiceName: "svc-with-a-fairly-long-name", Environment: "prod", Kind: model.LogDeploy},
 	})
+	httpSrc := model.Source{ServiceName: "svc-with-a-fairly-long-name", Environment: "prod", Kind: model.LogHTTP}
+	p.activeKey[httpSrc.Key()] = true
 	p.append(model.LogLine{
-		Source:  model.Source{ServiceName: "svc-with-a-fairly-long-name", Environment: "prod", Kind: model.LogHTTP},
+		Source:  httpSrc,
 		Level:   "error",
 		Message: strings.Repeat("boom ", 30),
 	})
